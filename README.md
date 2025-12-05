@@ -1,4 +1,4 @@
-# AstrBot E2B 云沙箱插件 (E2B Sandbox)
+# AstrBot E2B 云沙箱插件 (astrbot_plugin_e2b_sandbox)
 
 ![Platform](https://img.shields.io/badge/Platform-Windows%20Tested-blue)
 ![License](https://img.shields.io/badge/License-AGPL--3.0-green)
