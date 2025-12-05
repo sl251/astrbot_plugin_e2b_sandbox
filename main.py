@@ -36,9 +36,9 @@ class E2BSandboxPlugin(Star):
         if cache_key in self._last_execution:
             last_time, last_result = self._last_execution[cache_key]
             if current_time - last_time < 30:
-                logger.info(f"[E2B] 检测到重复调用，终止循环")
-                event.set_result(MessageEventResult().message(f"代码执行结果：\n{last_result}"))
-                return
+                logger.info(f"[E2B] 检测到重复调用，返回缓存结果")
+                # 【修改点】: 删除 event.set_result(...)，改为 return 一个和下面格式一致的字符串
+                return f"代码已成功执行，结果如下：\n{last_result}\n\n请将以上结果用自然语言告诉用户。"
 
         logger.info(f"[E2B] 开始执行代码: {code[:100]}")
 
