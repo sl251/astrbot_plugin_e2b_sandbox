@@ -62,7 +62,7 @@ pip install e2b-code-interpreter
 | `e2b_api_key` | E2B API Key (以 `e2b_` 开头) | 必填 |
 | `timeout` | 单次代码执行超时时间（秒） | 60 |
 | `max_output_length` | 最大文本输出长度（防止刷屏） | 2000 |
-| `default_silent_mode` | 将结果返回模型 	关闭 (False)
+| `default_silent_mode` | 将结果返回模型 	 |关闭 (False)
 
 ## 💰 关于 E2B 额度（几乎无限！）
 
