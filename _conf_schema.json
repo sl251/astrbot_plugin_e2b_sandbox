@@ -1,0 +1,20 @@
+{
+  "e2b_api_key": {
+    "type": "string",
+    "title": "E2B API Key",
+    "description": "从 https://e2b.dev 获取的 API 密钥",
+    "default": ""
+  },
+  "timeout": {
+    "type": "number",
+    "title": "执行超时时间（秒）",
+    "description": "代码执行的最大等待时间",
+    "default": 30
+  },
+  "max_output_length": {
+    "type": "number",
+    "title": "最大输出长度",
+    "description": "返回给 LLM 的最大字符数，防止输出过长",
+    "default": 2000
+  }
+}
