@@ -8,7 +8,7 @@ author: sl251
 version: "1.0.0" 
 
 # 插件的简短描述
-description: "使用 E2B 云沙箱执行 Python 代码，支持 LLM 自然语言调用"
+description: "使用 E2B 云沙箱安全执行 Python 代码，支持通过 LLM 自然语言调用"
 
 # 插件的 GitHub 仓库地址 (新增)
 repo: "https://github.com/sl251/astrbot_plugin_e2b_sandbox"
