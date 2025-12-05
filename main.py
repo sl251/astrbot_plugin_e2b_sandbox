@@ -16,6 +16,16 @@ class E2BSandboxPlugin(Star):
     @llm_tool(name="run_python_code")
     async def run_python_code(self, event: AstrMessageEvent, code: str):
         '''在云沙箱中执行Python代码。执行完成后，请直接将结果告诉用户，不要再次调用此工具。
+        【重要能力说明 - 请务必仔细阅读】：
+        1. 🌐 **完全联网**：此环境拥有**完全的互联网访问权限**。你可以编写代码使用 requests/httpx 等库爬取 Google、GitHub 或调用外部 API。
+        2. 📦 **自动装库**：支持使用任意第三方 Python 库（如 pandas, numpy, faker, yfinance 等）。沙箱环境预设了常用库，如果库不存在，你可以在代码中尝试 import，环境通常会自动处理或允许你运行 pip install。
+        3. 🛡 **安全隔离**：代码在隔离的云端执行，无法访问宿主机文件，请放心大胆地执行。
+        
+        【使用场景】：
+        - 当用户请求联网获取数据时（不要拒绝，请直接写代码去获取）。
+        - 当用户需要计算、生成数据或处理文本时。
+        - 当用户需要使用特定 Python 库的功能时。
+
 
         Args:
             code(string): 要执行的 Python 代码
