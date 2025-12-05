@@ -28,9 +28,13 @@
 
 3.  **🚫 必须禁用系统自带插件**：
     由于 AstrBot 自带的 `astrbot_plugin_python_interpreter` (本地解释器) 功能与本插件重叠，**请务必在“插件管理” -> “系统插件”中将其禁用**，否则会导致 LLM 混淆、重复执行或报错。
+
+    
     <img width="317" alt="禁用自带插件" src="https://github.com/user-attachments/assets/3bb8999b-fcfb-4400-80dd-923702f1f337" />
 
-4.  **🌐 网络环境配置**：
+    
+
+5.  **🌐 网络环境配置**：
     E2B 的服务器位于海外。在国内网络环境下，**必须在 AstrBot 配置中设置 HTTP 代理**，否则无法连接沙箱。
     *   *Windows 用户提示：如果使用 v2rayN，建议开启独立的 HTTP 端口（如 10809），尽量避免使用 10808 混合端口，以防出现 `Server disconnected` 握手错误。*
 
@@ -77,7 +81,15 @@ pip install e2b-code-interpreter
 
 ### 运行效果演示
 
-![运行效果截图](https://github.com/sl251/astrbot_plugin_e2b_sandbox/assets/48489868/33423797-1755-4674-a639-656910e5272a)
+<img width="685" height="407" alt="image" src="https://github.com/user-attachments/assets/cc4528c3-e30e-4fd5-ad59-6b03afe31e49" />
+
+
+
+<img width="1369" height="814" alt="屏幕截图 2025-12-05 221054" src="https://github.com/user-attachments/assets/0cd59ebe-2117-4092-afd6-071a3e9d2d77" />
+
+
+
+<img width="1368" height="432" alt="屏幕截图 2025-12-05 221038" src="https://github.com/user-attachments/assets/c744b296-9982-4b07-96bc-1449fadc6785" />
 
 ## 📋 待办清单 (To-Do List)
 
