@@ -1,1 +1,26 @@
-{"e2b_api_key": {"type": "string","title": "E2B API Key","description": "从 https://e2b.dev 获取的 API 密钥","default": ""},"timeout": {"type": "int","title": "执行超时时间（秒）","description": "代码执行的最大等待时间","default": 30},"max_output_length": {"type": "int","title": "最大输出长度","description": "返回给 LLM 的最大字符数，防止输出过长","default": 2000}}
+{
+  "e2b_api_key": {
+    "type": "string",
+    "title": "E2B API Key",
+    "description": "从 https://e2b.dev 获取的 API 密钥",
+    "default": ""
+  },
+  "timeout": {
+    "type": "int",
+    "title": "执行超时时间（秒）",
+    "description": "代码执行的最大等待时间",
+    "default": 30
+  },
+  "max_output_length": {
+    "type": "int",
+    "title": "最大输出长度",
+    "description": "返回结果的最大字符数，防止输出过长",
+    "default": 2000
+  },
+  "default_silent_mode": {
+    "type": "bool",
+    "title": "默认将结果返回模型",
+    "description": "关闭: 直接输出结果给用户 开启: 结果返回模型",
+    "default": false
+  }
+}
