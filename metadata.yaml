@@ -1,33 +1,26 @@
-# 插件的唯一标识符，必须与插件目录名一致
-name: astrbot_plugin_e2b_sandbox
-
-# 插件作者
-author: sl251
-
-# 插件版本号
-version: "1.0.0" 
-
-# 插件的简短描述
-description: "使用 E2B 云沙箱安全执行 Python 代码，支持通过 LLM 自然语言调用"
-
-# 插件的 GitHub 仓库地址 (新增)
-repo: "https://github.com/sl251/astrbot_plugin_e2b_sandbox"
-
-# 插件依赖的 Python 库
-requirements:
-  - e2b-code-interpreter
-
-# 插件的配置项
-configs:
-  e2b_api_key:
-    type: str
-    default: ""
-    description: "E2B API Key (请前往 e2b.dev 注册获取)"
-  timeout:
-    type: int
-    default: 60
-    description: "代码执行超时时间（秒）"
-  max_output_length:
-    type: int
-    default: 2000
-    description: "最大输出长度"
+{
+  "e2b_api_key": {
+    "type": "string",
+    "title": "E2B API Key",
+    "description": "从 https://e2b.dev 获取的 API 密钥",
+    "default": ""
+  },
+  "timeout": {
+    "type": "int",
+    "title": "执行超时时间（秒）",
+    "description": "代码执行的最大等待时间",
+    "default": 30
+  },
+  "max_output_length": {
+    "type": "int",
+    "title": "最大输出长度",
+    "description": "返回结果的最大字符数，防止输出过长",
+    "default": 2000
+  },
+  "default_silent_mode": {
+    "type": "bool",
+    "title": "默认将结果返回模型",
+    "description": "关闭: 直接输出结果给用户 开启: 结果返回模型",
+    "default": false
+  }
+}
