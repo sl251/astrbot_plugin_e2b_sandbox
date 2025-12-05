@@ -18,15 +18,15 @@ class E2BSandboxPlugin(Star):
             code(string): 要执行的 Python 代码
         '''
         api_key = self.config.get("e2b_api_key", "")
-        if not api_key:
+        if not api_key or not api_key.strip():
             return "错误：未配置 E2B API Key，请在插件配置中设置。"
         
         timeout = self.config.get("timeout", 30)
         max_output_length = self.config.get("max_output_length", 2000)
         
         try:
-            async with AsyncSandbox.create(api_key=api_key, timeout=timeout) as sandbox:
-                execution = await sandbox.run_code(code)
+            async with AsyncSandbox.create(api_key=api_key) as sandbox:
+                execution = await sandbox.run_code(code, timeout=timeout)
                 
                 result_parts = []
                 
