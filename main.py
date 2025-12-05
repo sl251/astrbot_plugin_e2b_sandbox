@@ -1,3 +1,4 @@
+import traceback
 from astrbot.api.star import Context, Star, register
 from astrbot.api.event import AstrMessageEvent
 from astrbot.api import llm_tool, logger
@@ -17,16 +18,26 @@ class E2BSandboxPlugin(Star):
         Args:
             code(string): 要执行的 Python 代码
         '''
+        # 记录开始执行代码
+        logger.info(f"[E2B] 开始执行代码: {code[:100]}{'...' if len(code) > 100 else ''}")
+        
         api_key = self.config.get("e2b_api_key", "")
         if not api_key or not api_key.strip():
+            logger.warning("[E2B] API Key 未配置")
             return "错误：未配置 E2B API Key，请在插件配置中设置。"
+        
+        # 记录 API Key 状态
+        logger.info(f"[E2B] API Key 已配置，长度: {len(api_key)}")
         
         timeout = self.config.get("timeout", 30)
         max_output_length = self.config.get("max_output_length", 2000)
         
         try:
+            logger.info("[E2B] 正在创建沙箱...")
             async with AsyncSandbox.create(api_key=api_key) as sandbox:
+                logger.info("[E2B] 沙箱创建成功，开始执行代码...")
                 execution = await sandbox.run_code(code, timeout=timeout)
+                logger.info("[E2B] 代码执行完成")
                 
                 result_parts = []
                 
@@ -61,8 +72,11 @@ class E2BSandboxPlugin(Star):
                 if len(result) > max_output_length:
                     result = result[:max_output_length] + "\n\n... (输出过长，已截断)"
                 
+                logger.info(f"[E2B] 返回结果: {result[:100]}{'...' if len(result) > 100 else ''}")
                 return result
                 
         except Exception as e:
-            logger.error(f"E2B 执行错误: {e}")
+            error_traceback = traceback.format_exc()
+            logger.error(f"[E2B] 执行错误: {e}")
+            logger.error(f"[E2B] 错误堆栈:\n{error_traceback}")
             return f"代码执行失败: {str(e)}"
