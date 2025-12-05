@@ -87,10 +87,6 @@ pip install e2b-code-interpreter
 
 
 
-<img width="1369" height="814" alt="屏幕截图 2025-12-05 221054" src="https://github.com/user-attachments/assets/0cd59ebe-2117-4092-afd6-071a3e9d2d77" />
-
-
-
 <img width="1368" height="432" alt="屏幕截图 2025-12-05 221038" src="https://github.com/user-attachments/assets/c744b296-9982-4b07-96bc-1449fadc6785" />
 
 ## 📋 待办清单 (To-Do List)
