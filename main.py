@@ -30,16 +30,16 @@ class E2BSandboxPlugin(Star):
         Args:
             code(string): 要执行的 Python 代码
         '''
-        # 防重复调用
         cache_key = code. strip()
         current_time = time. time()
         if cache_key in self._last_execution:
             last_time, last_result = self._last_execution[cache_key]
             if current_time - last_time < 30:
-                logger.info(f"[E2B] 检测到重复调用，终止循环")
-                # 【修改 1】: 将之前导致警告和循环的逻辑，改为直接返回纯粹的缓存结果。
-                return last_result
-        
+                logger.info(f"[E2B] 检测到重复调用，直接发送结果并终止循环")
+                # 【修改点 1】: 使用 set_result 强制结束回合
+                event.set_result(MessageEventResult().message(f"检测到重复执行，返回缓存结果：\n{last_result}"))
+                return # 返回 None
+
         logger.info(f"[E2B] 开始执行代码: {code[:100]}")
         
         api_key = ""
@@ -48,14 +48,17 @@ class E2BSandboxPlugin(Star):
         
         if not api_key:
             logger.warning("[E2B] API Key 未配置")
-            return "错误：未配置 E2B API Key，请在插件配置中设置。"
-        
+            result = "错误：未配置 E2B API Key，请在插件配置中设置。"
+            event.set_result(MessageEventResult().message(result))
+            return
+
         logger.info(f"[E2B] API Key 已配置，长度: {len(api_key)}")
         
         timeout = self.config.get("timeout", 30) if self.config else 30
         max_output_length = self.config. get("max_output_length", 2000) if self.config else 2000
         
         sandbox = None
+        result = ""
         try:
             logger.info("[E2B] 正在创建沙箱...")
             sandbox = await AsyncSandbox. create(api_key=api_key)
@@ -89,18 +92,10 @@ class E2BSandboxPlugin(Star):
             if len(result) > max_output_length:
                 result = result[:max_output_length] + "\n.. .(已截断)"
             
-            logger.info(f"[E2B] 返回结果: {result[:100]}")
-            self._last_execution[cache_key] = (current_time, result)
-            
-            # 【修改 2】: 将之前返回给LLM的带有指令的话语，改为只返回纯粹的结果。
-            return result
-                
         except Exception as e:
             logger.error(f"[E2B] 执行错误: {e}")
             logger.error(f"[E2B] 错误堆栈:\n{traceback. format_exc()}")
             result = f"代码执行失败: {str(e)}"
-            self._last_execution[cache_key] = (current_time, result)
-            return result
         finally:
             if sandbox:
                 try:
@@ -108,3 +103,10 @@ class E2BSandboxPlugin(Star):
                     logger.info("[E2B] 沙箱已关闭")
                 except:
                     pass
+        
+        logger.info(f"[E2B] 最终结果: {result[:100]}")
+        self._last_execution[cache_key] = (current_time, result)
+        
+        # 【修改点 2】: 使用 set_result 将结果直接发送给用户，并强制结束 Agent 的决策循环
+        event.set_result(MessageEventResult().message(result))
+        return # 同样返回 None
