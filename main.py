@@ -1,3 +1,4 @@
+import traceback
 from astrbot.api.star import Context, Star, register
 from astrbot.api.event import AstrMessageEvent
 from astrbot.api import llm_tool, logger
@@ -75,7 +76,6 @@ class E2BSandboxPlugin(Star):
                 return result
                 
         except Exception as e:
-            import traceback
             error_traceback = traceback.format_exc()
             logger.error(f"[E2B] 执行错误: {e}")
             logger.error(f"[E2B] 错误堆栈:\n{error_traceback}")
