@@ -1,5 +1,30 @@
-name: "e2b_sandbox"
-description: "使用 E2B 云沙箱安全执行 Python 代码，支持 LLM 自然语言调用"
-author: "sl251"
-version: "1.0.0"
-repo: "https://github.com/sl251/astrbot_plugin_e2b_sandbox"
+# 插件的唯一标识符，必须与插件目录名一致
+name: astrbot_plugin_e2b_sandbox
+
+# 插件作者
+author: sl251
+
+# 插件版本号 (请确保与你代码 @register 里的版本一致)
+version: "1.0.1" 
+
+# 插件的简短描述 (必须与 @register 里的描述一致)
+description: "使用 E2B 云沙箱执行 Python 代码，支持 LLM 自然语言调用"
+
+# 插件依赖的 Python 库
+requirements:
+  - e2b-code-interpreter
+
+# 插件的配置项
+configs:
+  e2b_api_key:
+    type: str
+    default: ""
+    description: "E2B API Key (请前往 e2b.dev 注册获取)"
+  timeout:
+    type: int
+    default: 60
+    description: "代码执行超时时间（秒）"
+  max_output_length:
+    type: int
+    default: 2000
+    description: "最大输出长度"
