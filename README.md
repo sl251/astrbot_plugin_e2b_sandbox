@@ -2,7 +2,7 @@
 
 ![Platform](https://img.shields.io/badge/Platform-Windows%20)
 ![License](https://img.shields.io/badge/License-AGPL--3.0-green)
-![Python](https://img.shields.io/badge/Python-3.9+-blue)
+![Python](https://img.shields.io/badge/Python-3.9+-blue/Platform-Windows%20)
 ![Status](https://img.shields.io/badge/Status-Active-brightgreen)
 
 🚀 使用 E2B 云沙箱安全执行 Python 代码的 AstrBot 插件，支持 LLM 自然语言调用
