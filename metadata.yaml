@@ -5,7 +5,7 @@ name: astrbot_plugin_e2b_sandbox
 author: sl251
 
 # 插件版本号
-version: "1.0.0" 
+version: "1.0.1" 
 
 # 插件的简短描述
 description: "使用 E2B 云沙箱安全执行 Python 代码，支持通过 LLM 自然语言调用"
