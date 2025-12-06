@@ -146,6 +146,9 @@ print(sum(i for i in range(101) if is_prime(i)))
 - [E2B 官方网站](https://e2b.dev)
 
 ---
+#更新日志
+v1.0.0 在与ai评审员的深度交流中茅塞顿开
+v1.0.1 修复了沙箱中没有astrbot的bug(中译中：加了个图片logo)
 
 **如果您觉得这个插件好用，请给个 Star ⭐！这对我真的很重要！**
 
