@@ -1,13 +1,18 @@
 import traceback
 import asyncio
-from astrbot.api.all import *
-from astrbot.api.event import filter 
+# 修正导入：
+# 1. logger 直接从 api 导入
+# 2. star 模块从 api 导入，通过 star.Star 使用
+from astrbot.api import logger, star
+from astrbot.api.event import filter, AstrMessageEvent
 from e2b_code_interpreter import AsyncSandbox
 
-class Main(Star):
+# 使用 star.Star
+class Main(star.Star):
     """E2B 云沙箱执行 Python 代码插件"""
 
-    def __init__(self, context: Context, config=None):
+    # 使用 star.Context
+    def __init__(self, context: star.Context, config=None):
         super().__init__(context)
         self.config = config or {}
 
@@ -18,11 +23,13 @@ class Main(Star):
         Args:
             code (string): 要执行的 Python 代码
         """
+        # 1. 初始化 result，防止 UnboundLocalError
+        result = "初始化中..."
+        
         code_stripped = code.strip()
         sender_id = event.get_sender_id()
-        result = ""
 
-        # 1. 检查 API Key
+        # 2. 检查 API Key
         api_key = self.config.get("e2b_api_key", "")
         if not api_key:
             yield event.plain_result("❌ 错误：E2B API Key 未配置")
@@ -32,28 +39,21 @@ class Main(Star):
         timeout = self.config.get("timeout", 30)
         max_output_length = self.config.get("max_output_length", 2000)
 
-        sandbox = None # 初始化变量，确保 finally 能访问
+        # 3. 初始化资源变量
+        sandbox = None
         stdout_output = []
         stderr_output = []
         
-        # 2. 内存安全机制：实时统计长度
+        # 4. 共享状态
         current_len = 0
         is_truncated = False
 
-        def on_stdout(msg):
+        # 5. 通用日志处理函数 (满足 DRY 原则)
+        def append_log(msg, target_list):
             nonlocal current_len, is_truncated
             msg_str = str(msg)
             if current_len < max_output_length:
-                stdout_output.append(msg_str)
-                current_len += len(msg_str)
-            else:
-                is_truncated = True
-
-        def on_stderr(msg):
-            nonlocal current_len, is_truncated
-            msg_str = str(msg)
-            if current_len < max_output_length:
-                stderr_output.append(msg_str)
+                target_list.append(msg_str)
                 current_len += len(msg_str)
             else:
                 is_truncated = True
@@ -61,7 +61,7 @@ class Main(Star):
         try:
             logger.info(f"[E2B] 用户 {sender_id} 正在创建沙箱...")
             
-            # 3. 恢复使用 create() 方法，但在外层包裹 try...finally 确保 kill
+            # 创建沙箱
             sandbox = await asyncio.wait_for(
                 AsyncSandbox.create(api_key=api_key),
                 timeout=10
@@ -69,14 +69,18 @@ class Main(Star):
             
             logger.info(f"[E2B] 沙箱创建成功，开始执行...")
 
-            # 执行代码，设置超时
+            # 执行代码
             execution = await asyncio.wait_for(
-                sandbox.run_code(code_stripped, on_stdout=on_stdout, on_stderr=on_stderr),
+                sandbox.run_code(
+                    code_stripped, 
+                    on_stdout=lambda m: append_log(m, stdout_output), 
+                    on_stderr=lambda m: append_log(m, stderr_output)
+                ),
                 timeout=timeout
             )
             logger.info(f"[E2B] 执行完成")
 
-            # 4. 结果处理
+            # 结果处理
             result_parts = []
             if stdout_output:
                 result_parts.append("📤 输出:\n" + "".join(stdout_output))
@@ -95,7 +99,7 @@ class Main(Star):
                 result = "\n\n".join(result_parts)
 
             if is_truncated:
-                result += f"\n\n... (输出过长，已截断)"
+                result += f"\n\n... (输出过长，已在 {max_output_length} 字符处截断)"
 
         except asyncio.TimeoutError:
             result = f"❌ 代码执行超时（超过 {timeout} 秒）"
@@ -103,7 +107,7 @@ class Main(Star):
             logger.error(f"[E2B] 执行异常: {traceback.format_exc()}")
             result = f"❌ 执行出错: {str(e)}"
         finally:
-            # 5. 资源清理：手动 kill 沙箱
+            # 6. 资源清理
             if sandbox:
                 try:
                     await sandbox.kill()
@@ -111,6 +115,5 @@ class Main(Star):
                 except Exception as cleanup_err:
                     logger.warning(f"[E2B] 沙箱清理失败: {cleanup_err}")
 
-        # 6. 返回结果
         yield event.plain_result(result)
         event.stop_event()
