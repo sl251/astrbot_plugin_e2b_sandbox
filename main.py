@@ -5,7 +5,7 @@ from astrbot.api.event import AstrMessageEvent
 from e2b_code_interpreter import AsyncSandbox
 
 
-@star.register("e2b_sandbox", "sl251", "使用 E2B 云沙箱安全执行 Python 代码", "1.0.3", "https://github.com/sl251/astrbot_plugin_e2b_sandbox")
+@star.register("e2b_sandbox", "sl251", "使用 E2B 云沙箱安全执行 Python 代码", "1.0.0", "https://github.com/sl251/astrbot_plugin_e2b_sandbox")
 class Main(star.Star):
     """E2B 云沙箱执行 Python 代码插件"""
 
