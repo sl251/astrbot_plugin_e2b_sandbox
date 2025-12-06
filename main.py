@@ -1,3 +1,4 @@
+import re  # 新增：用于正则提取代码
 import traceback
 import asyncio
 # 保持正确的导入路径
@@ -20,21 +21,20 @@ class Main(star.Star):
             code (string): 要执行的 Python 代码
         """
         # 1. 初始化 result
-        result = "初始化中..."
+        result = "执行初始化中..."
         
-        # 2. 新增：Markdown 清理逻辑
-        # 解决 LLM 输出 ```python ... ``` 导致的 SyntaxError
-        code_proc = code.strip()
-        if code_proc.startswith("```"):
-            # 去掉第一行 (如 ```python)
-            first_newline = code_proc.find("\n")
-            if first_newline != -1:
-                code_proc = code_proc[first_newline+1:]
-            # 去掉结尾的 ```
-            if code_proc.endswith("```"):
-                code_proc = code_proc[:-3]
+        # 2. 增强版 Markdown 清理逻辑 (使用正则)
+        # 无论代码在回复的中间、开头还是结尾，都能提取出来
+        # 匹配 ```python ... ``` 或 ``` ... ```，re.DOTALL 让 . 能匹配换行符
+        match = re.search(r"```(?:python)?\s*(.*?)```", code, re.DOTALL | re.IGNORECASE)
         
-        code_stripped = code_proc.strip()
+        if match:
+            # 如果匹配到了代码块，提取中间的内容
+            code_to_run = match.group(1).strip()
+        else:
+            # 如果没匹配到，假设整个输入就是代码 (或者 LLM 没用 markdown)
+            code_to_run = code.strip()
+
         sender_id = event.get_sender_id()
 
         # 3. 检查 API Key
@@ -47,14 +47,16 @@ class Main(star.Star):
         timeout = self.config.get("timeout", 30)
         max_output_length = self.config.get("max_output_length", 2000)
 
-        sandbox = None
+        # 资源变量初始化
+        sandbox = None 
         stdout_output = []
         stderr_output = []
         
+        # 长度控制
         current_len = 0
         is_truncated = False
 
-        # 日志收集
+        # 日志收集辅助函数
         def append_log(msg, target_list):
             nonlocal current_len, is_truncated
             msg_str = str(msg)
@@ -67,7 +69,7 @@ class Main(star.Star):
         try:
             logger.info(f"[E2B] 用户 {sender_id} 正在创建沙箱...")
             
-            # 创建沙箱 (create + kill)
+            # 创建沙箱
             sandbox = await asyncio.wait_for(
                 AsyncSandbox.create(api_key=api_key),
                 timeout=10
@@ -78,7 +80,7 @@ class Main(star.Star):
             # 执行代码
             execution = await asyncio.wait_for(
                 sandbox.run_code(
-                    code_stripped, 
+                    code_to_run,  # 使用处理后的代码
                     on_stdout=lambda m: append_log(m, stdout_output), 
                     on_stderr=lambda m: append_log(m, stderr_output)
                 ),
@@ -89,15 +91,15 @@ class Main(star.Star):
             # 结果拼接
             result_parts = []
             if stdout_output:
-                result_parts.append("📤 Standard Output:\n" + "".join(stdout_output))
+                result_parts.append("📤 Output:\n" + "".join(stdout_output))
 
             if execution.error:
                 error_name = getattr(execution.error, 'name', '未知错误')
                 error_value = getattr(execution.error, 'value', '')
-                result_parts.append("❌ Execution Error: " + str(error_name) + ": " + str(error_value))
+                result_parts.append("❌ Error: " + str(error_name) + ": " + str(error_value))
 
             if stderr_output:
-                result_parts.append("⚠️ Standard Error:\n" + "".join(stderr_output))
+                result_parts.append("⚠️ Stderr:\n" + "".join(stderr_output))
             
             if execution.results:
                  result_parts.append(f"📈 Results: {str(execution.results)}")
@@ -124,6 +126,6 @@ class Main(star.Star):
                 except Exception as cleanup_err:
                     logger.warning(f"[E2B] 沙箱清理失败: {cleanup_err}")
 
-        # 4. 保持你原本的逻辑：Yield 给用户看，然后停止事件
+        # 4. 直接 yield 给用户
         yield event.plain_result(result)
         event.stop_event()
