@@ -1,7 +1,7 @@
 # AstrBot E2B 云沙箱插件 (astrbot_plugin_e2b_sandbox)
 
 ![Platform](https://img.shields.io/badge/Platform-Windows%20)
-![License](https://img.shields.io/badge/License-AGPL--3.0-green/Platform-Windows%20)
+![License](https://img.shields.io/badge/License-AGPL--3.0-green)
 ![Python](https://img.shields.io/badge/Python-3.9+-blue)
 ![Status](https://img.shields.io/badge/Status-Active-brightgreen)
 
