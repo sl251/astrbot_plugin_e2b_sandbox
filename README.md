@@ -5,7 +5,7 @@
 ![Python](https://img.shields.io/badge/Python-3.9+-blue)
 ![Status](https://img.shields.io/badge/Status-Active-brightgreen)
 
-🚀 使用 E2B 云沙箱安全执行 Python 代码的 AstrBot 插件，支持 LLM 自然语言调用
+使用 E2B 云沙箱安全执行 Python 代码的 AstrBot 插件，支持 LLM 自然语言调用
 
 这是 AstrBot 的增强型代码执行工具，它将不安全的本地 Python 执行环境替换为隔离的云端沙箱。无需担心破坏宿主机环境
 
