@@ -1,4 +1,4 @@
-<img width="1347" height="733" alt="image" src="https://github.com/user-attachments/assets/7c441768-fbd9-4735-9acc-116a4601058a" /># AstrBot E2B 云沙箱插件 (astrbot_plugin_e2b_sandbox)
+# AstrBot E2B 云沙箱插件 (astrbot_plugin_e2b_sandbox)
 
 ![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20Docker-blue)
 ![License](https://img.shields.io/badge/License-AGPL--3.0-green)
