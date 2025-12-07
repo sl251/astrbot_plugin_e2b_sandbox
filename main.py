@@ -7,9 +7,10 @@ import os
 
 from astrbot.api import logger, star
 from astrbot.api.event import filter, AstrMessageEvent
+# 关键修复：图片组件必须从这里导入，否则会报 has no attribute 'Image'
 from astrbot.api.message_components import Image, Plain
 
-# E2B 兼容性导入
+# 尝试导入 E2B
 try:
     from e2b_code_interpreter import AsyncSandbox
 except ImportError:
@@ -25,113 +26,132 @@ class Main(star.Star):
         super().__init__(context)
         self.config = config or {}
 
-    @filter.llm_tool(name="execute_python_code")
-    async def execute_python_code(self, event: AstrMessageEvent, code: str = None, **kwargs) -> str:
-        """在云沙箱中执行 Python 代码。
-        Args:
-            code (str): 要执行的 Python 代码。
-        """
-        # --- 1. 参数防御 ---
-        if code is None: code = kwargs.get('code')
-        if code is None: return "❌ 系统错误：未接收到代码参数。"
-        if AsyncSandbox is None: return "❌ 严重错误：未找到 AsyncSandbox 类。"
+    # 1. 增加默认值和 kwargs，防止参数报错
+    @filter.llm_tool(name="run_python_code")
+    async def run_python_code(self, event: AstrMessageEvent, code: str = None, **kwargs):
+        """在云沙箱中执行 Python 代码
 
+        Args:
+            code (string): 要执行的 Python 代码
+        """
+        # 参数防御逻辑
+        if code is None:
+            code = kwargs.get('code')
+        
+        # 如果依然没有代码，报错并结束
+        if not code:
+            yield event.plain_result("❌ 系统错误：未接收到代码参数。")
+            event.stop_event()
+            return
+
+        # Markdown 清理
         match = re.search(r"```(?:python)?\s*(.*?)```", code, re.DOTALL | re.IGNORECASE)
         code_to_run = match.group(1).strip() if match else code.strip()
-        
-        api_key = self.config.get("e2b_api_key", "")
-        if not api_key: return "❌ 错误：E2B API Key 未配置。"
-        timeout = self.config.get("timeout", 30)
-        
-        sandbox = None
-        
-        try:
-            # 💡 提示用户正在运行（消除等待焦虑）
-            # await event.send(event.plain_result("🚀 正在云端执行代码..."))
-            logger.info(f"[E2B] 开始连接沙箱...")
-            
-            # --- 2. 创建沙箱 & 执行 ---
-            try:
-                sandbox = await asyncio.wait_for(AsyncSandbox.create(api_key=api_key), timeout=15)
-            except asyncio.TimeoutError:
-                return "❌ 连接 E2B 服务器超时 (Check Network/API Key)."
-            
-            execution = None
-            if hasattr(sandbox, 'run_code'):
-                execution = await asyncio.wait_for(sandbox.run_code(code_to_run), timeout=timeout)
-            elif hasattr(sandbox, 'notebook') and hasattr(sandbox.notebook, 'exec_cell'):
-                execution = await asyncio.wait_for(sandbox.notebook.exec_cell(code_to_run), timeout=timeout)
-            else:
-                return "❌ SDK 错误：找不到执行方法"
 
-            # --- 3. 插件直接接管输出 (不依赖 LLM) ---
+        sender_id = event.get_sender_id()
+        api_key = self.config.get("e2b_api_key", "")
+        if not api_key:
+            yield event.plain_result("❌ 错误：E2B API Key 未配置")
+            event.stop_event()
+            return
+
+        if AsyncSandbox is None:
+            yield event.plain_result("❌ 严重错误：未找到 AsyncSandbox 类。")
+            event.stop_event()
+            return
+
+        timeout = self.config.get("timeout", 30)
+        sandbox = None 
+
+        try:
+            logger.info(f"[E2B] 用户 {sender_id} 正在创建沙箱...")
             
-            # 3.1 处理图片 (只发一张，避免重复)
+            # 创建沙箱
+            sandbox = await asyncio.wait_for(
+                AsyncSandbox.create(api_key=api_key),
+                timeout=15
+            )
+            
+            # 执行代码
+            execution = await asyncio.wait_for(
+                sandbox.run_code(code_to_run),
+                timeout=timeout
+            )
+            logger.info(f"[E2B] 执行完成")
+
+            # --- 结果处理 (直接 yield 输出) ---
+            
+            # 1. 优先处理图片
             has_sent_image = False
             if execution.results:
                 for res in execution.results:
-                    if has_sent_image: break 
+                    if has_sent_image: break # 避免重复发图
 
                     img_data = None
                     img_ext = ""
-                    if hasattr(res, 'png') and res.png: img_data = res.png; img_ext = ".png"
-                    elif hasattr(res, 'jpeg') and res.jpeg: img_data = res.jpeg; img_ext = ".jpg"
+
+                    if hasattr(res, 'png') and res.png:
+                        img_data = res.png; img_ext = ".png"
+                    elif hasattr(res, 'jpeg') and res.jpeg:
+                        img_data = res.jpeg; img_ext = ".jpg"
                     elif hasattr(res, 'formats'): 
                         if 'png' in res.formats: img_data = res.formats['png']; img_ext = ".png"
                         elif 'jpeg' in res.formats: img_data = res.formats['jpeg']; img_ext = ".jpg"
 
                     if img_data:
                         try:
+                            # 解码并保存临时文件
                             img_bytes = base64.b64decode(img_data)
                             with tempfile.NamedTemporaryFile(suffix=img_ext, delete=False) as tmp_file:
                                 tmp_file.write(img_bytes)
                                 tmp_path = tmp_file.name
                             
-                            # 直接发送图片
+                            # 构建图片消息链
+                            # 使用 yield 直接推送给用户
                             chain = [Image.fromFileSystem(tmp_path)]
-                            await event.send(event.chain_result(chain))
+                            yield event.chain_result(chain)
                             
                             has_sent_image = True
+                            logger.info("[E2B] 图片已直接 yield 给用户")
+                            
                             if os.path.exists(tmp_path): os.remove(tmp_path)
                         except Exception as e:
                             logger.error(f"发图失败: {e}")
+                            yield event.plain_result(f"⚠️ 图片处理失败: {e}")
 
-            # 3.2 处理文字日志 (插件自己发，防止 LLM 复读)
-            logs_text = ""
+            # 2. 处理文字日志 (Stdout/Stderr)
+            logs_output = []
             if hasattr(execution, 'logs'):
-                parts = []
-                if execution.logs.stdout: parts.append("".join(execution.logs.stdout))
-                if execution.logs.stderr: parts.append("".join(execution.logs.stderr))
-                logs_text = "\n".join(parts).strip()
-
-            if logs_text:
-                # 只有当日志不为空时才发
-                if len(logs_text) > 1200:
-                    logs_text = logs_text[:1200] + "\n...(Output Truncated)"
-                try:
-                    await event.send(event.plain_result(f"📝 运行输出:\n{logs_text}"))
-                except: pass
-            elif not has_sent_image:
-                # 既没图也没字，发个提示
-                await event.send(event.plain_result("✅ 代码执行完成 (无可见输出)"))
-
-            # --- 4. 关键：给 LLM 一个闭嘴指令 ---
-            # 我们不使用 stop_event (会卡UI)，也不返回 log (会重复)
-            # 我们返回一个指令，强迫 LLM 结束对话。
+                if execution.logs.stdout:
+                    logs_output.append("📤 Output:\n" + "".join(execution.logs.stdout))
+                if execution.logs.stderr:
+                    logs_output.append("⚠️ Stderr:\n" + "".join(execution.logs.stderr))
             
-            return (
-                "SYSTEM: The code execution result (images/logs) has already been sent to the user directly by the plugin.\n"
-                "SYSTEM: Your task is complete. DO NOT repeat the output.\n"
-                "SYSTEM: Please reply with a single emoji '✅' to confirm completion."
-            )
+            # 拼接文字结果
+            result_text = "\n\n".join(logs_output)
+            
+            # 如果有文字结果，yield 文字
+            if result_text:
+                if len(result_text) > 2000:
+                    result_text = result_text[:2000] + "\n...(输出过长截断)"
+                yield event.plain_result(result_text)
+            
+            # 如果既没图也没字
+            if not has_sent_image and not result_text:
+                yield event.plain_result("✅ 代码执行成功 (无可见输出)")
 
         except asyncio.TimeoutError:
-            return f"❌ Execution timed out (>{timeout}s)."
+            yield event.plain_result(f"❌ 执行超时 (>{timeout}s)")
         except Exception as e:
-            return f"❌ System Error: {str(e)}"
+            logger.error(f"[E2B] 执行异常: {traceback.format_exc()}")
+            yield event.plain_result(f"❌ 系统错误: {str(e)}")
         finally:
             if sandbox:
                 try:
                     if hasattr(sandbox, 'kill'): await sandbox.kill()
                     elif hasattr(sandbox, 'close'): await sandbox.close()
                 except Exception: pass
+
+        # 3. 核心：强制停止事件
+        # 这会直接切断 LLM 的后续处理，前端收到这个信号后应该停止 loading
+        event.stop_event()
