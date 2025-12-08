@@ -4,10 +4,11 @@ import asyncio
 import base64
 import tempfile
 import os
+import hashlib
+from collections import defaultdict
 
 from astrbot.api import logger, star
 from astrbot.api.event import filter, AstrMessageEvent
-# 关键修复：图片组件必须从这里导入，否则会报 has no attribute 'Image'
 from astrbot.api.message_components import Image, Plain
 
 # 尝试导入 E2B
@@ -25,67 +26,86 @@ class Main(star.Star):
     def __init__(self, context: star.Context, config=None):
         super().__init__(context)
         self.config = config or {}
+        # 【修复1】使用字典隔离不同会话的哈希，防止多用户干扰
+        # 格式: {session_id: last_code_hash}
+        self.code_hashes = defaultdict(str)
 
-    # 1. 增加默认值和 kwargs，防止参数报错
     @filter.llm_tool(name="run_python_code")
     async def run_python_code(self, event: AstrMessageEvent, code: str = None, **kwargs):
-        """在云沙箱中执行 Python 代码
-
+        """在云沙箱中执行 Python 代码。
+        
+        【重要能力说明】
+        1. **无状态环境**：每次调用都是全新的环境，**不支持**跨轮次变量记忆。如果需要使用之前的变量，请重新定义。
+        2. **支持绘图**：支持 matplotlib/PIL。
+        3. **绘图规范**：必须将图片保存为文件（如 'plot.png'），**严禁**使用 plt.show()。
+        4. 系统会自动检测并发送生成的图片。
+        
         Args:
             code (string): 要执行的 Python 代码
         """
-        # 参数防御逻辑
         if code is None:
             code = kwargs.get('code')
         
-        # 如果依然没有代码，报错并结束
         if not code:
-            yield event.plain_result("❌ 系统错误：未接收到代码参数。")
-            event.stop_event()
-            return
+            return "❌ System Error: No code received."
 
         # Markdown 清理
         match = re.search(r"```(?:python)?\s*(.*?)```", code, re.DOTALL | re.IGNORECASE)
         code_to_run = match.group(1).strip() if match else code.strip()
 
-        sender_id = event.get_sender_id()
+        # --- 【修复1】基于 Session ID 的防重复调用 ---
+        # 获取会话唯一ID (优先使用 session_id，没有则用 sender_id)
+        session_id = getattr(event, "session_id", event.get_sender_id())
+        
+        current_hash = hashlib.md5(code_to_run.encode('utf-8')).hexdigest()
+        if self.code_hashes[session_id] == current_hash:
+            logger.warning(f"[E2B] 拦截到会话 {session_id} 的重复代码调用")
+            return (
+                "⚠️ SYSTEM WARNING: You have already executed this exact code just now. \n"
+                "Do NOT run it again. The image has already been generated and sent to the user.\n"
+                "Please formulate your final response to the user based on the previous execution."
+            )
+        self.code_hashes[session_id] = current_hash
+        # -------------------------------------------
+
+        # --- 【修复3】强制设置 Matplotlib 后端，防止 plt.show() 卡死 ---
+        # 在用户代码前拼接一段配置代码
+        setup_code = "import matplotlib\nmatplotlib.use('Agg')\nimport matplotlib.pyplot as plt\n"
+        full_code = setup_code + code_to_run
+        # -----------------------------------------------------------
+
         api_key = self.config.get("e2b_api_key", "")
         if not api_key:
-            yield event.plain_result("❌ 错误：E2B API Key 未配置")
-            event.stop_event()
-            return
-
+            return "❌ Error: E2B API Key is missing."
         if AsyncSandbox is None:
-            yield event.plain_result("❌ 严重错误：未找到 AsyncSandbox 类。")
-            event.stop_event()
-            return
+            return "❌ Error: AsyncSandbox class not found."
 
         timeout = self.config.get("timeout", 30)
         sandbox = None 
+        llm_feedback = []
 
         try:
-            logger.info(f"[E2B] 用户 {sender_id} 正在创建沙箱...")
+            logger.info(f"[E2B] Session {session_id} creating sandbox...")
             
-            # 创建沙箱
             sandbox = await asyncio.wait_for(
                 AsyncSandbox.create(api_key=api_key),
                 timeout=15
             )
             
-            # 执行代码
+            # 执行代码 (使用拼接后的代码)
             execution = await asyncio.wait_for(
-                sandbox.run_code(code_to_run),
+                sandbox.run_code(full_code),
                 timeout=timeout
             )
-            logger.info(f"[E2B] 执行完成")
+            logger.info(f"[E2B] Execution finished.")
 
-            # --- 结果处理 (直接 yield 输出) ---
+            # --- 结果处理 ---
             
-            # 1. 优先处理图片
+            # 图片处理 (后台异步发送)
             has_sent_image = False
             if execution.results:
                 for res in execution.results:
-                    if has_sent_image: break # 避免重复发图
+                    if has_sent_image: break 
 
                     img_data = None
                     img_ext = ""
@@ -100,58 +120,70 @@ class Main(star.Star):
 
                     if img_data:
                         try:
-                            # 解码并保存临时文件
                             img_bytes = base64.b64decode(img_data)
-                            with tempfile.NamedTemporaryFile(suffix=img_ext, delete=False) as tmp_file:
-                                tmp_file.write(img_bytes)
-                                tmp_path = tmp_file.name
                             
-                            # 构建图片消息链
-                            # 使用 yield 直接推送给用户
-                            chain = [Image.fromFileSystem(tmp_path)]
-                            yield event.chain_result(chain)
+                            # 定义后台发送任务
+                            async def send_image_task(data, ext, evt):
+                                tmp_path = None
+                                try:
+                                    await asyncio.sleep(0.5) # 避让主流程
+                                    with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp_file:
+                                        tmp_file.write(data)
+                                        tmp_path = tmp_file.name
+                                    
+                                    chain = [Image.fromFileSystem(tmp_path)]
+                                    await evt.send(evt.chain_result(chain))
+                                    logger.info("[E2B] Async image sent successfully.")
+                                    
+                                except Exception as inner_e:
+                                    logger.error(f"[E2B] Async image send failed: {inner_e}")
+                                finally:
+                                    if tmp_path and os.path.exists(tmp_path):
+                                        try: os.remove(tmp_path)
+                                        except: pass
+
+                            asyncio.create_task(send_image_task(img_bytes, img_ext, event))
                             
                             has_sent_image = True
-                            logger.info("[E2B] 图片已直接 yield 给用户")
+                            llm_feedback.append("[System Notification: Image generated successfully and sent to user interface.]")
                             
-                            if os.path.exists(tmp_path): os.remove(tmp_path)
                         except Exception as e:
-                            logger.error(f"发图失败: {e}")
-                            yield event.plain_result(f"⚠️ 图片处理失败: {e}")
+                            logger.error(f"Image preparation failed: {e}")
+                            llm_feedback.append(f"[System Error: Image generation failed: {e}]")
 
-            # 2. 处理文字日志 (Stdout/Stderr)
-            logs_output = []
+            # 文字日志
             if hasattr(execution, 'logs'):
                 if execution.logs.stdout:
-                    logs_output.append("📤 Output:\n" + "".join(execution.logs.stdout))
+                    llm_feedback.append(f"📤 STDOUT:\n{''.join(execution.logs.stdout)}")
                 if execution.logs.stderr:
-                    logs_output.append("⚠️ Stderr:\n" + "".join(execution.logs.stderr))
+                    llm_feedback.append(f"⚠️ STDERR:\n{''.join(execution.logs.stderr)}")
             
-            # 拼接文字结果
-            result_text = "\n\n".join(logs_output)
+            result_text = "\n\n".join(llm_feedback)
+            if not result_text:
+                result_text = "✅ Code executed successfully (No visible output)."
             
-            # 如果有文字结果，yield 文字
-            if result_text:
-                if len(result_text) > 2000:
-                    result_text = result_text[:2000] + "\n...(输出过长截断)"
-                yield event.plain_result(result_text)
-            
-            # 如果既没图也没字
-            if not has_sent_image and not result_text:
-                yield event.plain_result("✅ 代码执行成功 (无可见输出)")
+            if len(result_text) > 3000:
+                result_text = result_text[:3000] + "\n...(Output truncated)"
+
+            final_return = (
+                f"{result_text}\n\n"
+                "--------------------------------------------------\n"
+                "[SYSTEM COMMAND: Execution Complete. \n"
+                "1. If an image was generated, it has been delivered.\n"
+                "2. DO NOT retry or run the code again.\n"
+                "3. Please explain the result to the user now.]"
+            )
+
+            return final_return
 
         except asyncio.TimeoutError:
-            yield event.plain_result(f"❌ 执行超时 (>{timeout}s)")
+            return f"❌ Execution timed out (>{timeout}s)."
         except Exception as e:
-            logger.error(f"[E2B] 执行异常: {traceback.format_exc()}")
-            yield event.plain_result(f"❌ 系统错误: {str(e)}")
+            logger.error(f"[E2B] Execution Exception: {traceback.format_exc()}")
+            return f"❌ Runtime Error: {str(e)}"
         finally:
             if sandbox:
                 try:
                     if hasattr(sandbox, 'kill'): await sandbox.kill()
                     elif hasattr(sandbox, 'close'): await sandbox.close()
                 except Exception: pass
-
-        # 3. 核心：强制停止事件
-        # 这会直接切断 LLM 的后续处理，前端收到这个信号后应该停止 loading
-        event.stop_event()
