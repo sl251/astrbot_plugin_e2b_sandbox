@@ -14,8 +14,13 @@
 - **v1.0.1**  修复了沙箱中没有astrbot的bug (加了个图片logo)
 - **v1.0.2**  买了一只笔，学会了画图，优化了结构
 - **v1.0.3**  代码运行结果现在会回传给 LLM，Bot 终于知道自己算出了什么，并能对结果进行解释，引入代码哈希检测与系统指令注入，彻底解决了 LLM 反复调用工具导致的死循环问题。
-   
-
+- **v1.0.4**  核心修复：
+  资源安全：引入服务端自动销毁机制（timeout 参数），彻底杜绝僵尸沙箱扣费
+  依赖自动安装：自动检测代码中的常用库（如 matplotlib）并执行 pip install，解决 ModuleNotFoundError
+  中文支持：自动注入中文字体，解决画图乱码问题
+  SDK 适配：修复了新版 E2B SDK 参数报错的问题
+  优化了插件文档的图片格式
+  感谢@xboHodx和@IMAUZSA的反馈和建议以及@LiYH2008的鼓励
 ## ✨ 核心特性
 
 ### 🔒 安全隔离
@@ -117,20 +122,12 @@ AstrBot 官网的标题是：AstrBot - 多平台大模型机器人基础设施
 ### 2️⃣ 进行python代码计算
 <img width="2062" height="420" alt="image" src="https://github.com/user-attachments/assets/7ecf12b4-d633-4edf-b260-5a7c5ea925f7" />
 
-
-
-
-
-
-
-
 ### 3️⃣ 绘图能力 (v1.0.3 优化)
 > **用户**："用 Python 画一个爱心函数的图像，并保存显示"
 
 插件会自动生成代码、执行绘图、将图片发送给你，并由 LLM 告诉你“图片已生成”。
 
 <img width="2083" height="826" alt="image" src="https://github.com/user-attachments/assets/d73b55a5-c3c6-4752-96e7-7bf240949fb4" />
-
 
 ## 📝 注意事项 (Limitations)
 
