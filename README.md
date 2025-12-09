@@ -121,14 +121,11 @@ AstrBot 官网的标题是：AstrBot - 多平台大模型机器人基础设施
 ```
 ### 2️⃣ 进行python代码计算
 <img width="2062" height="420" alt="image" src="https://github.com/user-attachments/assets/7ecf12b4-d633-4edf-b260-5a7c5ea925f7" />
-
 ### 3️⃣ 绘图能力 (v1.0.3 优化)
 > **用户**："用 Python 画一个爱心函数的图像，并保存显示"
 
 插件会自动生成代码、执行绘图、将图片发送给你，并由 LLM 告诉你“图片已生成”。
-
 <img width="2083" height="826" alt="image" src="https://github.com/user-attachments/assets/d73b55a5-c3c6-4752-96e7-7bf240949fb4" />
-
 ## 📝 注意事项 (Limitations)
 
 - **无状态环境**：为了节省成本和保证环境纯净，**每次对话（Tool Call）都会创建一个全新的沙箱**。这意味着你不能在第一句话定义 `x=1`，然后在第二句话打印 `print(x)`。如果需要使用之前的变量，请让 LLM 在一段代码中重新定义。
