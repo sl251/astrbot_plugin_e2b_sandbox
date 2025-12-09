@@ -66,7 +66,7 @@ class Main(star.Star):
         if AsyncSandbox is None:
             return "❌ Error: AsyncSandbox class not found."
 
-        # 客户端等待时间 (虽然我们设了60s，但 AstrBot 核心也有60s限制)
+        # 客户端等待时间
         exec_timeout = self.config.get("timeout", 60)
         sandbox_lifespan = exec_timeout + 30 
 
@@ -86,7 +86,7 @@ class Main(star.Star):
 
             # --- 自动检测并安装依赖 ---
             libs_to_install = []
-            # 【优化】移除了 scipy, sklearn 等巨型库，防止安装超时
+            # 移除了巨型库，只保留核心库
             common_libs = [
                 'matplotlib', 'numpy', 'pandas', 
                 'requests', 'bs4', 'wordcloud', 'jieba', 'seaborn'
@@ -101,7 +101,6 @@ class Main(star.Star):
             if libs_to_install:
                 install_cmd = f"pip install {' '.join(libs_to_install)}"
                 logger.info(f"[E2B] Auto-installing dependencies: {libs_to_install}")
-                # 给安装留出时间
                 await sandbox.commands.run(install_cmd, timeout=120)
 
             # --- 注入中文字体与后端配置 ---
@@ -139,20 +138,31 @@ except: pass
             )
             logger.info(f"[E2B] Execution finished.")
 
-            # --- 结果处理 ---
+            # --- 结果处理 (修复 TypeError) ---
             has_sent_image = False
             if execution.results:
                 for res in execution.results:
                     if has_sent_image: break 
                     img_data = None
                     img_ext = ""
+
+                    # 1. 优先检查直接属性 (E2B SDK v1.x 标准)
                     if hasattr(res, 'png') and res.png:
                         img_data = res.png; img_ext = ".png"
                     elif hasattr(res, 'jpeg') and res.jpeg:
                         img_data = res.jpeg; img_ext = ".jpg"
+                    
+                    # 2. 兼容性检查 formats (修复报错的关键点)
                     elif hasattr(res, 'formats'): 
-                        if 'png' in res.formats: img_data = res.formats['png']; img_ext = ".png"
-                        elif 'jpeg' in res.formats: img_data = res.formats['jpeg']; img_ext = ".jpg"
+                        # 如果是方法则调用，如果是属性则直接用
+                        formats_data = res.formats() if callable(res.formats) else res.formats
+                        
+                        # 确保拿到的是字典再操作
+                        if isinstance(formats_data, dict):
+                            if 'png' in formats_data: 
+                                img_data = formats_data['png']; img_ext = ".png"
+                            elif 'jpeg' in formats_data: 
+                                img_data = formats_data['jpeg']; img_ext = ".jpg"
 
                     if img_data:
                         try:
@@ -201,9 +211,7 @@ except: pass
             return final_return
 
         except asyncio.CancelledError:
-            # 【新增】捕获 AstrBot 的强制超时取消信号
-            logger.warning("[E2B] Task cancelled by AstrBot Core (Timeout > 60s). Cleaning up sandbox...")
-            # 这里不返回内容，因为 AstrBot 已经抛出异常了，我们主要为了触发 finally 清理
+            logger.warning("[E2B] Task cancelled by AstrBot Core (Timeout). Cleaning up sandbox...")
             raise 
         except asyncio.TimeoutError:
             return f"❌ Execution timed out (>{exec_timeout}s). Installing libraries might take time."
