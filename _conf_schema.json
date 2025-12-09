@@ -8,8 +8,8 @@
   "timeout": {
     "type": "int",
     "title": "执行超时时间（秒）",
-    "description": "代码执行的最大等待时间，默认 30 秒",
-    "default": 30
+    "description": "代码执行的最大等待时间，默认 60 秒",
+    "default": 60
   },
   "max_output_length": {
     "type": "int",
