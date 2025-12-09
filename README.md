@@ -14,13 +14,14 @@
 - **v1.0.1**  修复了沙箱中没有astrbot的bug (加了个图片logo)
 - **v1.0.2**  买了一只笔，学会了画图，优化了结构
 - **v1.0.3**  代码运行结果现在会回传给 LLM，Bot 终于知道自己算出了什么，并能对结果进行解释，引入代码哈希检测与系统指令注入，彻底解决了 LLM 反复调用工具导致的死循环问题。
-- **v1.0.4**  核心修复：
-  资源安全：引入服务端自动销毁机制（timeout 参数），彻底杜绝僵尸沙箱扣费；
-  依赖自动安装：自动检测代码中的常用库（如 matplotlib）并执行 pip install，解决 ModuleNotFoundError；
-  中文支持：自动注入中文字体，解决画图乱码问题；
-  SDK 适配：修复了新版 E2B SDK 参数报错的问题；
-  优化了插件文档的图片格式；
-  感谢 @xboHodx 和 @IMAUZSA 的反馈建议以及 @LiYH2008 的鼓励！
+- **v1.0.4**  🛡️ **核心修复与体验优化**：
+  - **资源安全**：引入服务端自动销毁机制（timeout 参数），彻底杜绝僵尸沙箱扣费。
+  - **依赖自动安装**：自动检测代码中的常用库（如 matplotlib）并执行 pip install，解决 ModuleNotFoundError。
+  - **中文支持**：自动注入中文字体，解决画图乱码问题。
+  - **SDK 适配**：修复了新版 E2B SDK 参数报错的问题。
+  - **文档优化**：优化了插件文档的图片格式。
+  - *感谢 @xboHodx 和 @IMAUZSA 的反馈建议以及 @LiYH2008 的鼓励！*
+
 ## ✨ 核心特性
 
 ### 🔒 安全隔离
@@ -119,13 +120,17 @@ print(re.findall(r'<title>(.*?)</title>', res.text)[0])
 (LLM 会读取上述代码的输出，并回答你)
 AstrBot 官网的标题是：AstrBot - 多平台大模型机器人基础设施
 ```
-### 2️⃣ 进行python代码计算
-<img width="2062" height="420" alt="image" src="https://github.com/user-attachments/assets/7ecf12b4-d633-4edf-b260-5a7c5ea925f7" />
+
+### 2️⃣ 进行 Python 代码计算
+![代码计算示例](https://github.com/user-attachments/assets/7ecf12b4-d633-4edf-b260-5a7c5ea925f7)
+
 ### 3️⃣ 绘图能力 (v1.0.3 优化)
 > **用户**："用 Python 画一个爱心函数的图像，并保存显示"
 
 插件会自动生成代码、执行绘图、将图片发送给你，并由 LLM 告诉你“图片已生成”。
-<img width="2083" height="826" alt="image" src="https://github.com/user-attachments/assets/d73b55a5-c3c6-4752-96e7-7bf240949fb4" />
+
+![绘图示例](https://github.com/user-attachments/assets/d73b55a5-c3c6-4752-96e7-7bf240949fb4)
+
 ## 📝 注意事项 (Limitations)
 
 - **无状态环境**：为了节省成本和保证环境纯净，**每次对话（Tool Call）都会创建一个全新的沙箱**。这意味着你不能在第一句话定义 `x=1`，然后在第二句话打印 `print(x)`。如果需要使用之前的变量，请让 LLM 在一段代码中重新定义。
@@ -148,3 +153,4 @@ AstrBot 官网的标题是：AstrBot - 多平台大模型机器人基础设施
 
 ## 许可证
 AGPL-3.0 - 详见 [LICENSE](LICENSE) 文件
+```
