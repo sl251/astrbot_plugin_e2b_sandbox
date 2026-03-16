@@ -1,20 +1,38 @@
 {
   "e2b_api_key": {
     "type": "string",
-    "title": "E2B API Key",
-    "description": "从 https://e2b.dev 获取的 API 密钥",
+    "title": "E2B API 密钥",
+    "description": "来自 https://e2b.dev 的 E2B API 密钥",
     "default": ""
   },
   "timeout": {
     "type": "int",
     "title": "执行超时时间（秒）",
-    "description": "代码执行的最大等待时间，默认 60 秒",
+    "description": "最大执行时长（秒）。默认值：60",
     "default": 60
   },
   "max_output_length": {
     "type": "int",
     "title": "最大输出长度",
-    "description": "返回结果的最大字符数，防止输出过长",
+    "description": "返回给大语言模型的最大字符数",
     "default": 2000
+  },
+  "proxy": {
+    "type": "string",
+    "title": "代理 URL",
+    "description": "可选的代理地址，例如 http://127.0.0.1:10809",
+    "default": ""
+  },
+  "max_return_file_size_mb": {
+    "type": "int",
+    "title": "最大返回文件大小（MB）",
+    "description": "从沙箱下载并发送给用户的生成文件的最大大小",
+    "default": 5
+  },
+  "file_retention_hours": {
+    "type": "int",
+    "title": "文件保留时长（小时）",
+    "description": "导出的本地文件在清理前保留的时长",
+    "default": 24
   }
 }
