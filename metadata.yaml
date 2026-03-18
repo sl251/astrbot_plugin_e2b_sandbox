@@ -1,7 +1,7 @@
 name: astrbot_plugin_e2b_sandbox
 author: sl251
-version: "1.0.8"
-description: "在 E2B 沙箱中运行 Python 代码，支持 LLM 调用、代理、文件暂存和本地导出发送。"
+version: "1.0.9"
+description: "使用 E2B 云沙箱执行 Python 代码，支持 LLM 调用、代理、文件桥接、模板选择，以及由模型决定发送结果文件。"
 repo: "https://github.com/sl251/astrbot_plugin_e2b_sandbox"
 
 requirements:
@@ -15,20 +15,24 @@ configs:
   timeout:
     type: int
     default: 60
-    description: "执行超时时间（秒）"
+    description: "单次执行超时时间（秒）"
   max_output_length:
     type: int
     default: 2000
-    description: "返回给大语言模型的最大文本长度"
+    description: "返回给 LLM 的最大文本长度"
   proxy:
     type: str
     default: ""
     description: "可选代理地址，例如 http://127.0.0.1:10809"
+  default_template:
+    type: str
+    default: ""
+    description: "可选的 E2B 模板 ID。留空时使用默认沙箱环境"
   max_return_file_size_mb:
     type: int
     default: 5
-    description: "从沙箱下载并发送给用户的生成文件最大大小（MB）"
+    description: "允许下载并发送给用户的单个生成文件最大大小（MB）"
   file_retention_hours:
     type: int
     default: 24
-    description: "导出的本地文件在清理前保留的时长（小时）"
+    description: "exports/ 本地缓存文件的保留时长（小时）"
