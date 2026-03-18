@@ -269,12 +269,12 @@ class Main(star.Star):
     async def e2b_run_python_code(
         self,
         event: AstrMessageEvent,
-        code: str = None,
+        code: str = "",
         template: str = "",
         **kwargs,
     ):
         """Run Python code in an E2B sandbox with an optional template."""
-        if code is None:
+        if not code:
             code = kwargs.pop("code", None)
         else:
             kwargs.pop("code", None)
@@ -285,8 +285,12 @@ class Main(star.Star):
         return await self.run_python_code(event, code=code, template=template, **kwargs)
 
     @filter.llm_tool(name="e2b_list_files")
-    async def e2b_list_files(self, event: AstrMessageEvent):
-        """List generated files cached from the latest E2B execution in this session."""
+    async def e2b_list_files(self, event: AstrMessageEvent, _: str = ""):
+        """List generated files cached from the latest E2B execution in this session.
+
+        Note: The unused placeholder parameter ensures the generated function schema
+        includes a non-empty properties block for provider compatibility.
+        """
         session_id = self._get_session_id(event)
         self._mark_session_active(event)
         generated_files = self.generated_files.get(session_id, [])
@@ -305,7 +309,7 @@ class Main(star.Star):
         self,
         event: AstrMessageEvent,
         file_name: str = "",
-        file_index: int = 0,
+        file_index: str = "0",
         name: str = "",
     ):
         """Send one cached generated file to the user by name or 1-based index."""
