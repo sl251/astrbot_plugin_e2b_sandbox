@@ -12,7 +12,10 @@ import tempfile
 import time
 import traceback
 import urllib.request
+import base64 as py_base64
+import zipfile
 from collections import defaultdict
+from io import BytesIO
 from pathlib import Path
 
 import astrbot.api.message_components as Comp
@@ -33,13 +36,16 @@ except ImportError:
 DEFAULT_EXEC_TIMEOUT = 60
 DEFAULT_OUTPUT_LIMIT = 2000
 DEFAULT_PROXY = ""
+DEFAULT_TEMPLATE = ""
 DEFAULT_UPLOAD_DIR = "/home/user/uploads"
 DEFAULT_WORK_DIR = "/home/user"
 DEFAULT_EXPORT_DIRNAME = "exports"
 MAX_RESULT_LIMIT = 20000
 MAX_SESSION_FILE_COUNT = 5
+MAX_GENERATED_FILE_CANDIDATES = 3
 DEFAULT_MAX_RETURN_FILE_SIZE_MB = 5
 DEFAULT_FILE_RETENTION_HOURS = 24
+DEFAULT_SESSION_RETENTION_HOURS = 12
 SANDBOX_PATH_PATTERN = re.compile(r"(/home/user(?:/[\w\-. \u4e00-\u9fff]+)+)")
 
 IMPORT_PACKAGE_MAP = {
@@ -67,10 +73,13 @@ class Main(star.Star):
         self.config = config or {}
         self.code_hashes = defaultdict(str)
         self.session_files = defaultdict(list)
+        self.generated_files = defaultdict(list)
         self.sent_file_signatures = defaultdict(set)
+        self.session_last_access = {}
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def remember_session_files(self, event: AstrMessageEvent):
+        self._mark_session_active(event)
         files = self._extract_event_files(event)
         if not files:
             return
@@ -102,6 +111,7 @@ class Main(star.Star):
         """
         if code is None:
             code = kwargs.get("code")
+        template = kwargs.get("template")
 
         if not code:
             return "Error: No code received."
@@ -110,6 +120,7 @@ class Main(star.Star):
         code_to_run = match.group(1).strip() if match else code.strip()
 
         session_id = self._get_session_id(event)
+        self._mark_session_active(event)
         pending_files = self._get_pending_files(event)
         hash_source = json.dumps(
             {"code": code_to_run, "files": pending_files},
@@ -122,6 +133,7 @@ class Main(star.Star):
             logger.warning(f"[E2B] Duplicate execution intercepted for session {session_id}")
             return "SYSTEM WARNING: Duplicate code execution intercepted."
         self.code_hashes[session_id] = current_hash
+        self.generated_files[session_id] = []
 
         api_key = self.config.get("e2b_api_key", "")
         if not api_key:
@@ -152,6 +164,7 @@ class Main(star.Star):
                 api_key=api_key,
                 timeout=sandbox_lifespan,
                 proxy=proxy,
+                template=template,
             )
 
             uploaded_paths = await self._stage_pending_files(event, sandbox, pending_files)
@@ -217,7 +230,7 @@ class Main(star.Star):
             )
             if sent_files:
                 llm_feedback.append(
-                    "[System Notification] Generated files sent to user interface: "
+                    "[System Notification] Generated files are ready. Use e2b_send_file to send one: "
                     + ", ".join(sent_files)
                 )
 
@@ -231,7 +244,7 @@ class Main(star.Star):
                 "--------------------------------------------------\n"
                 "[SYSTEM COMMAND: Execution Complete.\n"
                 "1. If an image was generated, it has been delivered.\n"
-                "2. If a file was generated, the plugin has already attempted to deliver it automatically.\n"
+                "2. If a file was generated, call e2b_send_file to send the right one.\n"
                 "3. DO NOT retry or run the code again.\n"
                 "4. DO NOT call send_message_to_user with /home/user/... sandbox file paths.\n"
                 "5. Explain the result to the user now.]"
@@ -252,6 +265,88 @@ class Main(star.Star):
                 except Exception:
                     pass
 
+    @filter.llm_tool(name="e2b_run_python_code")
+    async def e2b_run_python_code(
+        self,
+        event: AstrMessageEvent,
+        code: str = None,
+        template: str = "",
+        **kwargs,
+    ):
+        """Run Python code in an E2B sandbox with an optional template."""
+        if code is None:
+            code = kwargs.pop("code", None)
+        else:
+            kwargs.pop("code", None)
+        if not template:
+            template = kwargs.pop("template", "")
+        else:
+            kwargs.pop("template", None)
+        return await self.run_python_code(event, code=code, template=template, **kwargs)
+
+    @filter.llm_tool(name="e2b_list_files")
+    async def e2b_list_files(self, event: AstrMessageEvent):
+        """List generated files cached from the latest E2B execution in this session."""
+        session_id = self._get_session_id(event)
+        self._mark_session_active(event)
+        generated_files = self.generated_files.get(session_id, [])
+        if not generated_files:
+            return "No generated files are currently cached for this session."
+
+        lines = []
+        for index, file_meta in enumerate(generated_files, start=1):
+            lines.append(
+                f"{index}. {file_meta['name']} ({file_meta['size']} bytes, source: {file_meta['remote_path']})"
+            )
+        return "Cached generated files:\n" + "\n".join(lines)
+
+    @filter.llm_tool(name="e2b_send_file")
+    async def e2b_send_file(
+        self,
+        event: AstrMessageEvent,
+        file_name: str = "",
+        file_index: int = 0,
+        name: str = "",
+    ):
+        """Send one cached generated file to the user by name or 1-based index."""
+        session_id = self._get_session_id(event)
+        self._mark_session_active(event)
+        generated_files = self.generated_files.get(session_id, [])
+        if not generated_files:
+            return "No generated files are currently cached for this session."
+
+        if not file_name and name:
+            file_name = name
+
+        selected = None
+        normalized_name = self._basename(file_name).lower().strip() if file_name else ""
+        if normalized_name:
+            for file_meta in generated_files:
+                if file_meta["name"].lower() == normalized_name:
+                    selected = file_meta
+                    break
+
+        if selected is None and file_index:
+            idx = self._safe_int(file_index, 0, minimum=1, maximum=len(generated_files))
+            if idx:
+                selected = generated_files[idx - 1]
+
+        if selected is None:
+            selected = generated_files[0]
+
+        local_path = Path(selected["local_path"])
+        if not local_path.exists():
+            return f"Cached file not found on disk: {selected['name']}"
+
+        signature = selected.get("signature")
+        if signature in self.sent_file_signatures[session_id]:
+            return f"File already sent in this session: {selected['name']}"
+
+        await self._send_local_file(event, local_path)
+        if signature:
+            self.sent_file_signatures[session_id].add(signature)
+        return f"Sent file to user: {selected['name']}"
+
     @filter.on_llm_request()
     async def inject_file_hint(self, event: AstrMessageEvent, req: ProviderRequest):
         req.system_prompt += (
@@ -259,7 +354,7 @@ class Main(star.Star):
             "and files or variables created in one call will not exist in the next call unless recreated or re-uploaded. "
             "Do not rely on cross-call state. Do not use top-level return in Python scripts. "
             "Do not use send_message_to_user to send sandbox file paths such as /home/user/... . "
-            "This plugin will automatically try to return generated files to the user."
+            "When files are generated, use e2b_list_files and e2b_send_file to choose which one to send."
         )
 
         pending_files = self._get_pending_files(event)
@@ -281,28 +376,39 @@ class Main(star.Star):
             "\n\n[System Notice] The current session has cached user files that will be uploaded "
             "to the E2B sandbox before code execution. Prefer reading them from these paths:\n"
             + "\n".join(file_list)
-            + "\n[System Notice] If you want generated files to be sent back to the user, save them under /home/user/uploads/. "
+            + "\n[System Notice] If you want generated files to be available for sending, save them under /home/user/uploads/. "
             "The plugin will also try to detect printed /home/user/... file paths automatically. "
-            "After generating a file, just explain the result to the user. "
+            "After generating files, use e2b_list_files to inspect candidates and e2b_send_file to send the correct one. "
             "Do not call send_message_to_user with a file attachment that points to a sandbox path."
         )
 
-    async def _create_sandbox(self, api_key: str, timeout: int, proxy: str):
+    async def _create_sandbox(self, api_key: str, timeout: int, proxy: str, template: str = ""):
         create_kwargs = {
             "api_key": api_key,
             "timeout": timeout,
         }
         if proxy:
             create_kwargs["proxy"] = proxy
+        template = str(template or self.config.get("default_template", DEFAULT_TEMPLATE) or "").strip()
+        if template:
+            create_kwargs["template"] = template
 
-        try:
-            return await asyncio.wait_for(AsyncSandbox.create(**create_kwargs), timeout=20)
-        except TypeError:
-            if proxy:
-                logger.warning("[E2B] Current SDK does not accept proxy on create(); retrying without it.")
-                create_kwargs.pop("proxy", None)
+        unsupported_options = []
+        if proxy:
+            unsupported_options.append(("proxy", "[E2B] Current SDK does not accept proxy on create(); retrying without it."))
+        if template:
+            unsupported_options.append(("template", "[E2B] Current SDK does not accept template on create(); retrying without it."))
+
+        while True:
+            try:
                 return await asyncio.wait_for(AsyncSandbox.create(**create_kwargs), timeout=20)
-            raise
+            except TypeError:
+                if not unsupported_options:
+                    raise
+                option_key, warning_text = unsupported_options.pop(0)
+                if option_key in create_kwargs:
+                    logger.warning(warning_text)
+                    create_kwargs.pop(option_key, None)
 
     async def _install_dependencies(self, sandbox, packages):
         install_cmd = (
@@ -496,6 +602,7 @@ class Main(star.Star):
         before_snapshot,
     ):
         self._cleanup_export_cache()
+        self._cleanup_session_cache()
 
         session_id = self._get_session_id(event)
         generated_files = await self._collect_generated_files(
@@ -506,28 +613,27 @@ class Main(star.Star):
             before_snapshot,
         )
         if not generated_files:
+            self.generated_files[session_id] = []
             return []
 
-        sent_files = []
-        for file_name, file_bytes, _remote_path in generated_files:
+        cached_files = []
+        for file_name, file_bytes, remote_path, file_size, signature in generated_files:
             local_path = self._write_export_file(file_name, file_bytes)
             if not local_path:
                 continue
 
-            async def send_file_task(evt, path_obj: Path):
-                try:
-                    await asyncio.sleep(0.2)
-                    await evt.send(
-                        evt.chain_result([Comp.File(file=str(path_obj.resolve()), name=path_obj.name)])
-                    )
-                    logger.info(f"[E2B] Exported file sent successfully: {path_obj.name}")
-                except Exception as exc:
-                    logger.error(f"[E2B] Exported file send failed: {exc}")
+            cached_files.append(
+                {
+                    "name": local_path.name,
+                    "local_path": str(local_path.resolve()),
+                    "remote_path": remote_path,
+                    "size": file_size,
+                    "signature": signature,
+                }
+            )
 
-            asyncio.create_task(send_file_task(event, local_path))
-            sent_files.append(local_path.name)
-
-        return sent_files
+        self.generated_files[session_id] = cached_files
+        return [file_meta["name"] for file_meta in cached_files]
 
     def _build_execution_code(self, code_to_run: str) -> str:
         setup_code = """
@@ -874,15 +980,16 @@ except Exception:
                 continue
 
             try:
-                content = await sandbox.files.read(remote_path)
+                content = await self._read_sandbox_file_bytes(sandbox, remote_path)
             except Exception as exc:
                 logger.warning(f"[E2B] Failed to download generated file {remote_path}: {exc}")
                 continue
 
-            if isinstance(content, str):
-                content = content.encode("utf-8")
             if not content:
                 logger.info(f"[E2B] Skip generated file {file_name}: downloaded content is empty")
+                continue
+            if not self._is_valid_generated_file(file_name, content):
+                logger.warning(f"[E2B] Skip generated file {file_name}: integrity validation failed")
                 continue
 
             signature = self._build_file_signature(file_name, content)
@@ -898,16 +1005,21 @@ except Exception:
                 before_snapshot,
                 after_snapshot,
             )
-            candidates.append((score, file_name, content, remote_path, signature))
+            candidates.append((score, file_name, content, remote_path, file_size, signature))
 
         if not candidates:
             return []
 
         candidates.sort(key=lambda item: item[0], reverse=True)
-        best_score, file_name, content, remote_path, signature = candidates[0]
-        logger.info(f"[E2B] Selected generated file for return: {file_name} (score={best_score})")
-        self.sent_file_signatures[session_id].add(signature)
-        return [(file_name, content, remote_path)]
+        selected_candidates = candidates[:MAX_GENERATED_FILE_CANDIDATES]
+        logger.info(
+            "[E2B] Cached generated file candidates: "
+            + ", ".join(f"{item[1]} (score={item[0]})" for item in selected_candidates)
+        )
+        return [
+            (file_name, content, remote_path, file_size, signature)
+            for _score, file_name, content, remote_path, file_size, signature in selected_candidates
+        ]
 
     def _score_generated_file(self, remote_path, file_name, file_size, hint_texts, before_snapshot, after_snapshot):
         score = 0
@@ -1071,9 +1183,69 @@ except Exception:
             logger.warning(f"[E2B] Failed to download {url}: {exc}")
             return None
 
+    async def _read_sandbox_file_bytes(self, sandbox, remote_path: str):
+        command = (
+            "python - <<'PY'\n"
+            "import base64\n"
+            "from pathlib import Path\n"
+            f"path = Path({json.dumps(remote_path, ensure_ascii=False)})\n"
+            "print(base64.b64encode(path.read_bytes()).decode('ascii'))\n"
+            "PY"
+        )
+        result = await sandbox.commands.run(command, timeout=30)
+        exit_code = getattr(result, "exit_code", 0)
+        if exit_code not in (0, None):
+            stderr_text = getattr(result, "stderr", "") or getattr(result, "stdout", "")
+            raise RuntimeError(f"Failed to read sandbox file: {stderr_text}".strip())
+
+        stdout = getattr(result, "stdout", "") or ""
+        if isinstance(stdout, list):
+            stdout = "".join(stdout)
+        encoded = str(stdout).strip()
+        if not encoded:
+            return b""
+        return py_base64.b64decode(encoded)
+
     def _read_local_file(self, path: str):
         with open(path, "rb") as file_obj:
             return file_obj.read()
+
+    def _is_valid_generated_file(self, file_name: str, content: bytes) -> bool:
+        lower_name = file_name.lower()
+        zip_like_suffixes = (
+            ".xlsx",
+            ".xlsm",
+            ".xltx",
+            ".xltm",
+            ".docx",
+            ".pptx",
+            ".zip",
+        )
+        if not lower_name.endswith(zip_like_suffixes):
+            return True
+
+        try:
+            with zipfile.ZipFile(BytesIO(content)) as zip_file:
+                bad_member = zip_file.testzip()
+                if bad_member is not None:
+                    logger.warning(
+                        f"[E2B] Zip validation failed for {file_name}: corrupted member {bad_member}"
+                    )
+                    return False
+                return True
+        except zipfile.BadZipFile:
+            logger.warning(f"[E2B] Zip validation failed for {file_name}: bad zip container")
+            return False
+        except Exception as exc:
+            logger.warning(f"[E2B] Zip validation failed for {file_name}: {exc}")
+            return False
+
+    async def _send_local_file(self, event: AstrMessageEvent, path_obj: Path):
+        await asyncio.sleep(0.2)
+        await event.send(
+            event.chain_result([Comp.File(file=str(path_obj.resolve()), name=path_obj.name)])
+        )
+        logger.info(f"[E2B] Exported file sent successfully: {path_obj.name}")
 
     def _write_export_file(self, file_name: str, content: bytes):
         export_dir = self._get_export_dir()
@@ -1118,6 +1290,29 @@ except Exception:
                     path.unlink(missing_ok=True)
             except Exception as exc:
                 logger.warning(f"[E2B] Failed to cleanup export cache {path}: {exc}")
+
+    def _cleanup_session_cache(self):
+        now = time.time()
+        cutoff = now - DEFAULT_SESSION_RETENTION_HOURS * 3600
+        expired_session_ids = [
+            session_id
+            for session_id, last_access in self.session_last_access.items()
+            if last_access < cutoff
+        ]
+
+        for session_id in expired_session_ids:
+            self.session_last_access.pop(session_id, None)
+            self.code_hashes.pop(session_id, None)
+            self.session_files.pop(session_id, None)
+            self.generated_files.pop(session_id, None)
+            self.sent_file_signatures.pop(session_id, None)
+            logger.info(f"[E2B] Cleaned expired session cache: {session_id}")
+
+    def _mark_session_active(self, event: AstrMessageEvent):
+        session_id = self._get_session_id(event)
+        self.session_last_access[session_id] = time.time()
+        if len(self.session_last_access) % 20 == 0:
+            self._cleanup_session_cache()
 
     def _get_export_dir(self):
         return Path(__file__).resolve().parent / DEFAULT_EXPORT_DIRNAME
