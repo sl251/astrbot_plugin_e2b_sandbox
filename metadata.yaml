@@ -1,6 +1,6 @@
 name: astrbot_plugin_e2b_sandbox
 author: sl251
-version: "1.0.9"
+version: "1.1.0"
 description: "使用 E2B 云沙箱执行 Python 代码，支持 LLM 调用、代理、文件桥接、模板选择，以及由模型决定发送结果文件。"
 repo: "https://github.com/sl251/astrbot_plugin_e2b_sandbox"
 
