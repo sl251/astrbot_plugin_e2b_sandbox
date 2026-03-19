@@ -94,7 +94,12 @@ class Main(star.Star):
         logger.info(f"[E2B] Cached file metadata: {self.session_files[session_id]}")
 
     @filter.llm_tool(name="run_python_code")
-    async def run_python_code(self, event: AstrMessageEvent, code: str = None, **kwargs):
+    async def run_python_code(
+        self,
+        event: AstrMessageEvent,
+        code: str = "",
+        template: str = "",
+    ):
         """在 E2B 云沙箱中执行 Python 代码。
 
         重要说明：
@@ -109,10 +114,6 @@ class Main(star.Star):
         Args:
             code (string): 要执行的 Python 代码。
         """
-        if code is None:
-            code = kwargs.get("code")
-        template = kwargs.get("template")
-
         if not code:
             return "Error: No code received."
 
@@ -230,7 +231,7 @@ class Main(star.Star):
             )
             if sent_files:
                 llm_feedback.append(
-                    "[System Notification] Generated files are ready. Use e2b_send_file to send one: "
+                    "[System Notification] Generated files sent to user interface: "
                     + ", ".join(sent_files)
                 )
 
@@ -244,7 +245,7 @@ class Main(star.Star):
                 "--------------------------------------------------\n"
                 "[SYSTEM COMMAND: Execution Complete.\n"
                 "1. If an image was generated, it has been delivered.\n"
-                "2. If a file was generated, call e2b_send_file to send the right one.\n"
+                "2. If a file was generated, the plugin has already attempted to deliver it automatically.\n"
                 "3. DO NOT retry or run the code again.\n"
                 "4. DO NOT call send_message_to_user with /home/user/... sandbox file paths.\n"
                 "5. Explain the result to the user now.]"
@@ -265,32 +266,17 @@ class Main(star.Star):
                 except Exception:
                     pass
 
-    @filter.llm_tool(name="e2b_run_python_code")
     async def e2b_run_python_code(
         self,
         event: AstrMessageEvent,
         code: str = "",
         template: str = "",
-        **kwargs,
     ):
         """Run Python code in an E2B sandbox with an optional template."""
-        if not code:
-            code = kwargs.pop("code", None)
-        else:
-            kwargs.pop("code", None)
-        if not template:
-            template = kwargs.pop("template", "")
-        else:
-            kwargs.pop("template", None)
-        return await self.run_python_code(event, code=code, template=template, **kwargs)
+        return await self.run_python_code(event, code=code, template=template)
 
-    @filter.llm_tool(name="e2b_list_files")
-    async def e2b_list_files(self, event: AstrMessageEvent, _: str = ""):
-        """List generated files cached from the latest E2B execution in this session.
-
-        Note: The unused placeholder parameter ensures the generated function schema
-        includes a non-empty properties block for provider compatibility.
-        """
+    async def e2b_list_files(self, event: AstrMessageEvent, query: str = ""):
+        """List generated files cached from the latest E2B execution in this session."""
         session_id = self._get_session_id(event)
         self._mark_session_active(event)
         generated_files = self.generated_files.get(session_id, [])
@@ -304,12 +290,11 @@ class Main(star.Star):
             )
         return "Cached generated files:\n" + "\n".join(lines)
 
-    @filter.llm_tool(name="e2b_send_file")
     async def e2b_send_file(
         self,
         event: AstrMessageEvent,
         file_name: str = "",
-        file_index: str = "0",
+        file_index: int = 0,
         name: str = "",
     ):
         """Send one cached generated file to the user by name or 1-based index."""
@@ -358,7 +343,7 @@ class Main(star.Star):
             "and files or variables created in one call will not exist in the next call unless recreated or re-uploaded. "
             "Do not rely on cross-call state. Do not use top-level return in Python scripts. "
             "Do not use send_message_to_user to send sandbox file paths such as /home/user/... . "
-            "When files are generated, use e2b_list_files and e2b_send_file to choose which one to send."
+            "This plugin will automatically try to return generated files to the user."
         )
 
         pending_files = self._get_pending_files(event)
@@ -380,9 +365,9 @@ class Main(star.Star):
             "\n\n[System Notice] The current session has cached user files that will be uploaded "
             "to the E2B sandbox before code execution. Prefer reading them from these paths:\n"
             + "\n".join(file_list)
-            + "\n[System Notice] If you want generated files to be available for sending, save them under /home/user/uploads/. "
+            + "\n[System Notice] If you want generated files to be sent back to the user, save them under /home/user/uploads/. "
             "The plugin will also try to detect printed /home/user/... file paths automatically. "
-            "After generating files, use e2b_list_files to inspect candidates and e2b_send_file to send the correct one. "
+            "After generating a file, just explain the result to the user. "
             "Do not call send_message_to_user with a file attachment that points to a sandbox path."
         )
 
@@ -637,7 +622,18 @@ class Main(star.Star):
             )
 
         self.generated_files[session_id] = cached_files
-        return [file_meta["name"] for file_meta in cached_files]
+        if not cached_files:
+            return []
+
+        first_file = cached_files[0]
+        local_path = Path(first_file["local_path"])
+        signature = first_file.get("signature")
+        if signature not in self.sent_file_signatures[session_id]:
+            await self._send_local_file(event, local_path)
+            if signature:
+                self.sent_file_signatures[session_id].add(signature)
+
+        return [first_file["name"]]
 
     def _build_execution_code(self, code_to_run: str) -> str:
         setup_code = """
