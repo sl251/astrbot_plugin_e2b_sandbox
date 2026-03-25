@@ -15,14 +15,21 @@ import urllib.request
 import base64 as py_base64
 import zipfile
 from collections import defaultdict
+from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
+from typing import Any
 
 import astrbot.api.message_components as Comp
-from astrbot.api import logger, star
+from astrbot.api import FunctionTool, logger, star
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import Image
 from astrbot.api.provider import ProviderRequest
+
+try:
+    from astrbot.core.utils.astrbot_path import get_astrbot_data_path
+except ImportError:
+    get_astrbot_data_path = None
 
 try:
     from e2b_code_interpreter import AsyncSandbox
@@ -46,6 +53,9 @@ MAX_GENERATED_FILE_CANDIDATES = 3
 DEFAULT_MAX_RETURN_FILE_SIZE_MB = 5
 DEFAULT_FILE_RETENTION_HOURS = 24
 DEFAULT_SESSION_RETENTION_HOURS = 12
+DEFAULT_SANDBOX_TIMEOUT = 600
+DEFAULT_DUPLICATE_EXEC_WINDOW_SECONDS = 10
+PLUGIN_NAME = "astrbot_plugin_e2b_sandbox"
 SANDBOX_PATH_PATTERN = re.compile(r"(/home/user(?:/[\w\-. \u4e00-\u9fff]+)+)")
 
 IMPORT_PACKAGE_MAP = {
@@ -65,6 +75,204 @@ IMPORT_PACKAGE_MAP = {
 }
 
 
+@dataclass
+class RunPythonCodeTool(FunctionTool):
+    plugin: Any = field(repr=False, default=None)
+    name: str = "e2b_sandbox_run_python_code"
+    description: str = (
+        "Run Python code inside the current session's E2B sandbox. "
+        "The tool reuses the session sandbox when available and creates one automatically when needed."
+    )
+    parameters: dict = field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "description": "Python code to execute inside the sandbox.",
+                },
+                "template": {
+                    "type": "string",
+                    "description": "Optional E2B template ID used only when creating a new sandbox.",
+                },
+                "auto_pause": {
+                    "type": "boolean",
+                    "description": "Whether to automatically pause the sandbox after execution. Default is true.",
+                },
+            },
+            "required": ["code"],
+        }
+    )
+
+    async def run(
+        self,
+        event: AstrMessageEvent,
+        code: str,
+        template: str = "",
+        auto_pause: bool = True,
+    ):
+        return await self.plugin.run_python_code(
+            event,
+            code=code,
+            template=template,
+            auto_pause=auto_pause,
+        )
+
+
+@dataclass
+class CreateSandboxTool(FunctionTool):
+    plugin: Any = field(repr=False, default=None)
+    name: str = "e2b_sandbox_create"
+    description: str = (
+        "Create a sandbox for the current session. "
+        "If a sandbox already exists, this returns its status instead of creating a duplicate."
+    )
+    parameters: dict = field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "template": {
+                    "type": "string",
+                    "description": "Optional E2B template ID for the sandbox to create.",
+                },
+            },
+        }
+    )
+
+    async def run(self, event: AstrMessageEvent, template: str = ""):
+        return await self.plugin.create_session_sandbox(event, template=template)
+
+
+@dataclass
+class ResumeSandboxTool(FunctionTool):
+    plugin: Any = field(repr=False, default=None)
+    name: str = "e2b_sandbox_resume"
+    description: str = "Resume or reconnect to the current session's existing sandbox."
+    parameters: dict = field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "_": {
+                    "type": "string",
+                    "description": "Optional placeholder parameter for provider compatibility. Ignore this field.",
+                },
+            },
+        }
+    )
+
+    async def run(self, event: AstrMessageEvent, _: str = ""):
+        return await self.plugin.resume_session_sandbox(event)
+
+
+@dataclass
+class PauseSandboxTool(FunctionTool):
+    plugin: Any = field(repr=False, default=None)
+    name: str = "e2b_sandbox_pause"
+    description: str = "Pause the current session's sandbox and preserve its filesystem and memory state."
+    parameters: dict = field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "_": {
+                    "type": "string",
+                    "description": "Optional placeholder parameter for provider compatibility. Ignore this field.",
+                },
+            },
+        }
+    )
+
+    async def run(self, event: AstrMessageEvent, _: str = ""):
+        return await self.plugin.pause_session_sandbox(event)
+
+
+@dataclass
+class KillSandboxTool(FunctionTool):
+    plugin: Any = field(repr=False, default=None)
+    name: str = "e2b_sandbox_kill"
+    description: str = "Kill the current session's sandbox and delete its state permanently."
+    parameters: dict = field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "_": {
+                    "type": "string",
+                    "description": "Optional placeholder parameter for provider compatibility. Ignore this field.",
+                },
+            },
+        }
+    )
+
+    async def run(self, event: AstrMessageEvent, _: str = ""):
+        return await self.plugin.kill_session_sandbox(event)
+
+
+@dataclass
+class SandboxStatusTool(FunctionTool):
+    plugin: Any = field(repr=False, default=None)
+    name: str = "e2b_sandbox_status"
+    description: str = "Get the current session sandbox ID, status, template, and last active time."
+    parameters: dict = field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "_": {
+                    "type": "string",
+                    "description": "Optional placeholder parameter for provider compatibility. Ignore this field.",
+                },
+            },
+        }
+    )
+
+    async def run(self, event: AstrMessageEvent, _: str = ""):
+        return await self.plugin.get_session_sandbox_status(event)
+
+
+@dataclass
+class ListFilesTool(FunctionTool):
+    plugin: Any = field(repr=False, default=None)
+    name: str = "e2b_sandbox_list_files"
+    description: str = "List generated files cached from the latest sandbox execution in the current session."
+    parameters: dict = field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "_": {
+                    "type": "string",
+                    "description": "Optional placeholder parameter for provider compatibility. Ignore this field.",
+                },
+            },
+        }
+    )
+
+    async def run(self, event: AstrMessageEvent, _: str = ""):
+        return await self.plugin.e2b_list_files(event)
+
+
+@dataclass
+class SendFileTool(FunctionTool):
+    plugin: Any = field(repr=False, default=None)
+    name: str = "e2b_sandbox_send_file"
+    description: str = "Send one cached generated file to the user by file name or 1-based index."
+    parameters: dict = field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "file_name": {
+                    "type": "string",
+                    "description": "Exact cached file name to send.",
+                },
+                "file_index": {
+                    "type": "number",
+                    "description": "1-based index from e2b_sandbox_list_files when the file name is unknown.",
+                },
+            },
+        }
+    )
+
+    async def run(self, event: AstrMessageEvent, file_name: str = "", file_index: int = 0):
+        return await self.plugin.e2b_send_file(event, file_name=file_name, file_index=file_index)
+
+
 class Main(star.Star):
     """Use E2B cloud sandboxes to execute Python code safely."""
 
@@ -72,13 +280,40 @@ class Main(star.Star):
         super().__init__(context)
         self.config = config or {}
         self.code_hashes = defaultdict(str)
+        self.code_hash_timestamps = {}
         self.session_files = defaultdict(list)
         self.generated_files = defaultdict(list)
         self.sent_file_signatures = defaultdict(set)
         self.session_last_access = {}
+        self.session_locks = {}
+        self.sandbox_sessions = {}
+        self._plugin_data_dir = self._get_plugin_data_dir()
+        self._sandbox_state_path = self._plugin_data_dir / "sandbox_sessions.json"
+        self._load_sandbox_sessions()
+        self._register_llm_tools()
+
+    def _register_llm_tools(self):
+        tools = [
+            RunPythonCodeTool(plugin=self),
+            CreateSandboxTool(plugin=self),
+            ResumeSandboxTool(plugin=self),
+            PauseSandboxTool(plugin=self),
+            KillSandboxTool(plugin=self),
+            SandboxStatusTool(plugin=self),
+            ListFilesTool(plugin=self),
+            SendFileTool(plugin=self),
+        ]
+        add_tools = getattr(self.context, "add_llm_tools", None)
+        if add_tools is None:
+            raise RuntimeError("Current AstrBot version does not support context.add_llm_tools().")
+        add_tools(*tools)
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def remember_session_files(self, event: AstrMessageEvent):
+        if not self._is_user_allowed(event):
+            return
+
+        await self._cleanup_expired_sessions()
         self._mark_session_active(event)
         files = self._extract_event_files(event)
         if not files:
@@ -93,12 +328,12 @@ class Main(star.Star):
         )
         logger.info(f"[E2B] Cached file metadata: {self.session_files[session_id]}")
 
-    @filter.llm_tool(name="run_python_code")
     async def run_python_code(
         self,
         event: AstrMessageEvent,
         code: str = "",
         template: str = "",
+        auto_pause: bool = True,
     ):
         """在 E2B 云沙箱中执行 Python 代码。
 
@@ -117,10 +352,15 @@ class Main(star.Star):
         if not code:
             return "Error: No code received."
 
+        denied_message = self._get_user_access_denied_message(event)
+        if denied_message:
+            return denied_message
+
         match = re.search(r"```(?:python)?\s*(.*?)```", code, re.DOTALL | re.IGNORECASE)
         code_to_run = match.group(1).strip() if match else code.strip()
 
         session_id = self._get_session_id(event)
+        await self._cleanup_expired_sessions()
         self._mark_session_active(event)
         pending_files = self._get_pending_files(event)
         hash_source = json.dumps(
@@ -130,10 +370,11 @@ class Main(star.Star):
         )
         current_hash = hashlib.md5(hash_source.encode("utf-8")).hexdigest()
 
-        if self.code_hashes[session_id] == current_hash:
+        if self._is_duplicate_execution(session_id, current_hash):
             logger.warning(f"[E2B] Duplicate execution intercepted for session {session_id}")
             return "SYSTEM WARNING: Duplicate code execution intercepted."
         self.code_hashes[session_id] = current_hash
+        self.code_hash_timestamps[session_id] = time.time()
         self.generated_files[session_id] = []
 
         api_key = self.config.get("e2b_api_key", "")
@@ -149,8 +390,7 @@ class Main(star.Star):
             minimum=200,
             maximum=MAX_RESULT_LIMIT,
         )
-        proxy = str(self.config.get("proxy", DEFAULT_PROXY) or "").strip()
-        sandbox_lifespan = exec_timeout + 30
+        sandbox_lifespan = max(exec_timeout + 30, DEFAULT_SANDBOX_TIMEOUT)
 
         sandbox = None
         llm_feedback = []
@@ -159,124 +399,274 @@ class Main(star.Star):
         streamed_results = []
         before_snapshot = {}
 
-        try:
-            logger.info(f"[E2B] Session {session_id} creating sandbox...")
-            sandbox = await self._create_sandbox(
-                api_key=api_key,
-                timeout=sandbox_lifespan,
-                proxy=proxy,
+        async with self._get_session_lock(session_id):
+            try:
+                sandbox, sandbox_meta, sandbox_notice = await self._get_or_create_session_sandbox(
+                    event=event,
+                    template=template,
+                    timeout=sandbox_lifespan,
+                    create_if_missing=True,
+                )
+                if sandbox_notice:
+                    llm_feedback.append(f"[System Notification] {sandbox_notice}")
+
+                uploaded_paths = await self._stage_pending_files(event, sandbox, pending_files)
+                if uploaded_paths:
+                    llm_feedback.append(
+                        "[System Notification] Uploaded files: " + ", ".join(uploaded_paths)
+                    )
+
+                packages = self._detect_packages(code_to_run)
+                if packages:
+                    await self._install_dependencies(sandbox, packages)
+
+                before_snapshot = await self._snapshot_sandbox_files(sandbox)
+                full_code = self._build_execution_code(code_to_run)
+
+                logger.info("[E2B] Running user code...")
+                execution = await asyncio.wait_for(
+                    sandbox.run_code(
+                        full_code,
+                        on_stdout=lambda msg: streamed_stdout.append(self._stringify_output(msg)),
+                        on_stderr=lambda msg: streamed_stderr.append(self._stringify_output(msg)),
+                        on_result=lambda result: streamed_results.append(result),
+                        timeout=exec_timeout,
+                    ),
+                    timeout=exec_timeout + 5,
+                )
+                logger.info("[E2B] Execution finished.")
+
+                stdout_text = self._merge_chunks(streamed_stdout)
+                stderr_text = self._merge_chunks(streamed_stderr)
+
+                if hasattr(execution, "logs"):
+                    if not stdout_text and getattr(execution.logs, "stdout", None):
+                        stdout_text = "".join(execution.logs.stdout)
+                    if not stderr_text and getattr(execution.logs, "stderr", None):
+                        stderr_text = "".join(execution.logs.stderr)
+
+                if stdout_text:
+                    llm_feedback.append(f"STDOUT:\n{stdout_text}")
+                if stderr_text:
+                    llm_feedback.append(f"STDERR:\n{stderr_text}")
+
+                text_result = self._extract_text_result(execution, streamed_results)
+                if text_result:
+                    llm_feedback.append(f"RESULT:\n{text_result}")
+
+                execution_error = getattr(execution, "error", None)
+                if execution_error:
+                    llm_feedback.append(
+                        f"EXECUTION ERROR:\n{self._stringify_output(execution_error)}"
+                    )
+
+                has_sent_image = await self._handle_images(event, execution, streamed_results)
+                if has_sent_image:
+                    llm_feedback.append(
+                        "[System Notification] Image generated successfully and sent to user interface."
+                    )
+
+                sent_files = await self._handle_generated_files(
+                    event,
+                    sandbox,
+                    pending_files,
+                    [
+                        stdout_text,
+                        stderr_text,
+                        text_result,
+                        self._stringify_output(execution_error),
+                    ],
+                    before_snapshot,
+                )
+                if sent_files:
+                    llm_feedback.append(
+                        "[System Notification] Generated files cached for manual delivery: "
+                        + ", ".join(sent_files)
+                    )
+
+                self._update_sandbox_session(
+                    session_id,
+                    sandbox_meta["sandbox_id"],
+                    template=sandbox_meta.get("template", ""),
+                    status="running",
+                )
+
+                pause_summary = "Sandbox kept running."
+                if auto_pause:
+                    pause_method = await self._pause_sandbox(sandbox)
+                    self._update_sandbox_session(
+                        session_id,
+                        sandbox_meta["sandbox_id"],
+                        template=sandbox_meta.get("template", ""),
+                        status="paused",
+                    )
+                    pause_summary = f"Sandbox auto-paused with {pause_method}."
+
+                result_text = "\n\n".join(part for part in llm_feedback if part).strip()
+                if not result_text:
+                    result_text = "Code executed successfully (no visible output)."
+                result_text = self._truncate(result_text, output_limit)
+
+                return (
+                    f"{result_text}\n\n"
+                    "--------------------------------------------------\n"
+                    "[SYSTEM COMMAND: Execution Complete.\n"
+                    "1. If an image was generated, it has been delivered.\n"
+                    "2. If files were generated, they are cached locally in this session.\n"
+                    "3. Call e2b_sandbox_list_files to inspect candidates and e2b_sandbox_send_file to deliver the chosen file.\n"
+                    f"4. {pause_summary}\n"
+                    "5. Pass auto_pause=false only when you intentionally want the sandbox to remain running after this execution.\n"
+                    "6. Use e2b_sandbox_status, e2b_sandbox_pause, e2b_sandbox_resume, or e2b_sandbox_kill to control lifecycle explicitly.\n"
+                    "7. DO NOT call send_message_to_user with /home/user/... sandbox file paths.\n"
+                    "8. Explain the result to the user now.]"
+                )
+            except asyncio.CancelledError:
+                logger.warning(
+                    "[E2B] Task cancelled by AstrBot Core. Sandbox kept for manual lifecycle control."
+                )
+                raise
+            except asyncio.TimeoutError:
+                return f"Error: Execution timed out (>{exec_timeout}s)."
+            except Exception as exc:
+                logger.error(f"[E2B] Execution Exception: {traceback.format_exc()}")
+                return f"Runtime Error: {exc}"
+
+    async def create_session_sandbox(self, event: AstrMessageEvent, template: str = ""):
+        denied_message = self._get_user_access_denied_message(event)
+        if denied_message:
+            return denied_message
+
+        session_id = self._get_session_id(event)
+        await self._cleanup_expired_sessions()
+        self._mark_session_active(event)
+
+        async with self._get_session_lock(session_id):
+            _, sandbox_meta, notice = await self._get_or_create_session_sandbox(
+                event=event,
                 template=template,
+                timeout=DEFAULT_SANDBOX_TIMEOUT,
+                create_if_missing=True,
             )
-
-            uploaded_paths = await self._stage_pending_files(event, sandbox, pending_files)
-            if uploaded_paths:
-                llm_feedback.append(
-                    "[System Notification] Uploaded files: " + ", ".join(uploaded_paths)
-                )
-
-            packages = self._detect_packages(code_to_run)
-            if packages:
-                await self._install_dependencies(sandbox, packages)
-
-            before_snapshot = await self._snapshot_sandbox_files(sandbox)
-            full_code = self._build_execution_code(code_to_run)
-
-            logger.info("[E2B] Running user code...")
-            execution = await asyncio.wait_for(
-                sandbox.run_code(
-                    full_code,
-                    on_stdout=lambda msg: streamed_stdout.append(self._stringify_output(msg)),
-                    on_stderr=lambda msg: streamed_stderr.append(self._stringify_output(msg)),
-                    on_result=lambda result: streamed_results.append(result),
-                    timeout=exec_timeout,
-                ),
-                timeout=exec_timeout + 5,
-            )
-            logger.info("[E2B] Execution finished.")
-
-            stdout_text = self._merge_chunks(streamed_stdout)
-            stderr_text = self._merge_chunks(streamed_stderr)
-
-            if hasattr(execution, "logs"):
-                if not stdout_text and getattr(execution.logs, "stdout", None):
-                    stdout_text = "".join(execution.logs.stdout)
-                if not stderr_text and getattr(execution.logs, "stderr", None):
-                    stderr_text = "".join(execution.logs.stderr)
-
-            if stdout_text:
-                llm_feedback.append(f"STDOUT:\n{stdout_text}")
-            if stderr_text:
-                llm_feedback.append(f"STDERR:\n{stderr_text}")
-
-            text_result = self._extract_text_result(execution, streamed_results)
-            if text_result:
-                llm_feedback.append(f"RESULT:\n{text_result}")
-
-            execution_error = getattr(execution, "error", None)
-            if execution_error:
-                llm_feedback.append(f"EXECUTION ERROR:\n{self._stringify_output(execution_error)}")
-
-            has_sent_image = await self._handle_images(event, execution, streamed_results)
-            if has_sent_image:
-                llm_feedback.append(
-                    "[System Notification] Image generated successfully and sent to user interface."
-                )
-
-            sent_files = await self._handle_generated_files(
-                event,
-                sandbox,
-                pending_files,
-                [stdout_text, stderr_text, text_result, self._stringify_output(execution_error)],
-                before_snapshot,
-            )
-            if sent_files:
-                llm_feedback.append(
-                    "[System Notification] Generated files sent to user interface: "
-                    + ", ".join(sent_files)
-                )
-
-            result_text = "\n\n".join(part for part in llm_feedback if part).strip()
-            if not result_text:
-                result_text = "Code executed successfully (no visible output)."
-            result_text = self._truncate(result_text, output_limit)
-
+            message = notice or "Sandbox is ready."
             return (
-                f"{result_text}\n\n"
-                "--------------------------------------------------\n"
-                "[SYSTEM COMMAND: Execution Complete.\n"
-                "1. If an image was generated, it has been delivered.\n"
-                "2. If a file was generated, the plugin has already attempted to deliver it automatically.\n"
-                "3. DO NOT retry or run the code again.\n"
-                "4. DO NOT call send_message_to_user with /home/user/... sandbox file paths.\n"
-                "5. Explain the result to the user now.]"
+                f"{message}\n"
+                f"Sandbox ID: {sandbox_meta['sandbox_id']}\n"
+                f"Status: {sandbox_meta.get('status', 'running')}\n"
+                f"Template: {sandbox_meta.get('template') or '(default)'}"
             )
 
-        except asyncio.CancelledError:
-            logger.warning("[E2B] Task cancelled by AstrBot Core. Cleaning up sandbox...")
-            raise
-        except asyncio.TimeoutError:
-            return f"Error: Execution timed out (>{exec_timeout}s)."
-        except Exception as exc:
-            logger.error(f"[E2B] Execution Exception: {traceback.format_exc()}")
-            return f"Runtime Error: {exc}"
-        finally:
-            if sandbox:
-                try:
-                    await asyncio.wait_for(sandbox.kill(), timeout=5)
-                except Exception:
-                    pass
+    async def resume_session_sandbox(self, event: AstrMessageEvent):
+        denied_message = self._get_user_access_denied_message(event)
+        if denied_message:
+            return denied_message
 
-    async def e2b_run_python_code(
-        self,
-        event: AstrMessageEvent,
-        code: str = "",
-        template: str = "",
-    ):
-        """Run Python code in an E2B sandbox with an optional template."""
-        return await self.run_python_code(event, code=code, template=template)
+        session_id = self._get_session_id(event)
+        await self._cleanup_expired_sessions()
+        self._mark_session_active(event)
+
+        async with self._get_session_lock(session_id):
+            sandbox, sandbox_meta, notice = await self._get_or_create_session_sandbox(
+                event=event,
+                timeout=DEFAULT_SANDBOX_TIMEOUT,
+                create_if_missing=False,
+            )
+            if sandbox is None:
+                return "No sandbox exists for this session. Call e2b_sandbox_create or e2b_sandbox_run_python_code first."
+            return (
+                f"{notice or 'Sandbox resumed.'}\n"
+                f"Sandbox ID: {sandbox_meta['sandbox_id']}\n"
+                "Status: running"
+            )
+
+    async def pause_session_sandbox(self, event: AstrMessageEvent):
+        denied_message = self._get_user_access_denied_message(event)
+        if denied_message:
+            return denied_message
+
+        session_id = self._get_session_id(event)
+        await self._cleanup_expired_sessions()
+        self._mark_session_active(event)
+
+        async with self._get_session_lock(session_id):
+            sandbox_meta = self.sandbox_sessions.get(session_id)
+            if not sandbox_meta or not sandbox_meta.get("sandbox_id"):
+                return "No sandbox exists for this session."
+            if sandbox_meta.get("status") == "paused":
+                return f"Sandbox is already paused.\nSandbox ID: {sandbox_meta['sandbox_id']}"
+
+            sandbox = await self._connect_to_existing_sandbox(
+                sandbox_meta["sandbox_id"],
+                timeout=DEFAULT_SANDBOX_TIMEOUT,
+            )
+            pause_method = await self._pause_sandbox(sandbox)
+            self._update_sandbox_session(
+                session_id,
+                sandbox_meta["sandbox_id"],
+                template=sandbox_meta.get("template", ""),
+                status="paused",
+            )
+            return (
+                f"Sandbox paused with {pause_method}.\n"
+                f"Sandbox ID: {sandbox_meta['sandbox_id']}\n"
+                "State is preserved and can be resumed later."
+            )
+
+    async def kill_session_sandbox(self, event: AstrMessageEvent):
+        denied_message = self._get_user_access_denied_message(event)
+        if denied_message:
+            return denied_message
+
+        session_id = self._get_session_id(event)
+        await self._cleanup_expired_sessions()
+        self._mark_session_active(event)
+
+        async with self._get_session_lock(session_id):
+            sandbox_meta = self.sandbox_sessions.get(session_id)
+            if not sandbox_meta or not sandbox_meta.get("sandbox_id"):
+                return "No sandbox exists for this session."
+
+            try:
+                sandbox = await self._connect_to_existing_sandbox(
+                    sandbox_meta["sandbox_id"],
+                    timeout=DEFAULT_SANDBOX_TIMEOUT,
+                )
+                await asyncio.wait_for(sandbox.kill(), timeout=10)
+            except Exception as exc:
+                logger.warning(f"[E2B] Failed to kill sandbox {sandbox_meta['sandbox_id']}: {exc}")
+            self._delete_sandbox_session(session_id)
+            return f"Sandbox killed.\nSandbox ID: {sandbox_meta['sandbox_id']}"
+
+    async def get_session_sandbox_status(self, event: AstrMessageEvent):
+        denied_message = self._get_user_access_denied_message(event)
+        if denied_message:
+            return denied_message
+
+        session_id = self._get_session_id(event)
+        await self._cleanup_expired_sessions()
+        self._mark_session_active(event)
+
+        sandbox_meta = self.sandbox_sessions.get(session_id)
+        if not sandbox_meta or not sandbox_meta.get("sandbox_id"):
+            return "No sandbox exists for this session."
+
+        last_active = sandbox_meta.get("last_active", 0)
+        last_active_text = (
+            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_active))
+            if last_active
+            else "unknown"
+        )
+        return (
+            f"Sandbox ID: {sandbox_meta['sandbox_id']}\n"
+            f"Status: {sandbox_meta.get('status', 'unknown')}\n"
+            f"Template: {sandbox_meta.get('template') or '(default)'}\n"
+            f"Last active: {last_active_text}"
+        )
 
     async def e2b_list_files(self, event: AstrMessageEvent, query: str = ""):
         """List generated files cached from the latest E2B execution in this session."""
+        denied_message = self._get_user_access_denied_message(event)
+        if denied_message:
+            return denied_message
         session_id = self._get_session_id(event)
         self._mark_session_active(event)
         generated_files = self.generated_files.get(session_id, [])
@@ -298,6 +688,9 @@ class Main(star.Star):
         name: str = "",
     ):
         """Send one cached generated file to the user by name or 1-based index."""
+        denied_message = self._get_user_access_denied_message(event)
+        if denied_message:
+            return denied_message
         session_id = self._get_session_id(event)
         self._mark_session_active(event)
         generated_files = self.generated_files.get(session_id, [])
@@ -336,14 +729,295 @@ class Main(star.Star):
             self.sent_file_signatures[session_id].add(signature)
         return f"Sent file to user: {selected['name']}"
 
+    def _get_plugin_data_dir(self):
+        if get_astrbot_data_path is not None:
+            return Path(get_astrbot_data_path()) / "plugin_data" / getattr(self, "name", PLUGIN_NAME)
+        return Path(__file__).resolve().parent / "data"
+
+    def _load_sandbox_sessions(self):
+        self._plugin_data_dir.mkdir(parents=True, exist_ok=True)
+        if not self._sandbox_state_path.exists():
+            self.sandbox_sessions = {}
+            return
+
+        try:
+            with open(self._sandbox_state_path, "r", encoding="utf-8") as file_obj:
+                loaded = json.load(file_obj)
+            self.sandbox_sessions = loaded if isinstance(loaded, dict) else {}
+        except Exception as exc:
+            logger.warning(f"[E2B] Failed to load sandbox session state: {exc}")
+            self.sandbox_sessions = {}
+
+    def _save_sandbox_sessions(self):
+        self._plugin_data_dir.mkdir(parents=True, exist_ok=True)
+        temp_path = self._sandbox_state_path.with_suffix(".tmp")
+        try:
+            with open(temp_path, "w", encoding="utf-8") as file_obj:
+                json.dump(self.sandbox_sessions, file_obj, ensure_ascii=False, indent=2)
+            temp_path.replace(self._sandbox_state_path)
+        except Exception as exc:
+            logger.warning(f"[E2B] Failed to save sandbox session state: {exc}")
+
+    def _get_session_lock(self, session_id: str):
+        lock = self.session_locks.get(session_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self.session_locks[session_id] = lock
+        return lock
+
+    def _normalize_user_whitelist(self):
+        raw_value = self.config.get("user_whitelist", [])
+        if isinstance(raw_value, str):
+            entries = re.split(r"[\r\n,]+", raw_value)
+        elif isinstance(raw_value, list):
+            entries = raw_value
+        else:
+            entries = []
+        return {str(item).strip() for item in entries if str(item).strip()}
+
+    def _get_user_id(self, event: AstrMessageEvent):
+        message_obj = getattr(event, "message_obj", None)
+        sender = getattr(message_obj, "sender", None) if message_obj is not None else None
+        return (
+            getattr(sender, "user_id", None)
+            or getattr(sender, "qq", None)
+            or getattr(event, "sender_id", None)
+            or event.get_sender_id()
+        )
+
+    def _is_user_allowed(self, event: AstrMessageEvent):
+        whitelist = self._normalize_user_whitelist()
+        if not whitelist:
+            return False
+        return str(self._get_user_id(event)).strip() in whitelist
+
+    def _get_user_access_denied_message(self, event: AstrMessageEvent):
+        if self._is_user_allowed(event):
+            return ""
+        return (
+            "Access denied: the current user is not in user_whitelist. "
+            f"User ID: {self._get_user_id(event)}"
+        )
+
+    def _is_duplicate_execution(self, session_id: str, current_hash: str):
+        if self.code_hashes.get(session_id) != current_hash:
+            return False
+        last_time = self.code_hash_timestamps.get(session_id, 0)
+        return (time.time() - last_time) < DEFAULT_DUPLICATE_EXEC_WINDOW_SECONDS
+
+    def _effective_template(self, template: str = ""):
+        return str(template or self.config.get("default_template", DEFAULT_TEMPLATE) or "").strip()
+
+    def _extract_sandbox_id(self, sandbox):
+        for attr in ("sandbox_id", "id"):
+            value = getattr(sandbox, attr, None)
+            if value:
+                return str(value)
+        metadata = getattr(sandbox, "metadata", None)
+        for attr in ("sandbox_id", "id"):
+            value = getattr(metadata, attr, None)
+            if value:
+                return str(value)
+        return ""
+
+    def _update_sandbox_session(
+        self,
+        session_id: str,
+        sandbox_id: str,
+        template: str = "",
+        status: str = "running",
+    ):
+        self.sandbox_sessions[session_id] = {
+            "sandbox_id": str(sandbox_id),
+            "template": str(template or ""),
+            "status": status,
+            "last_active": time.time(),
+        }
+        self._save_sandbox_sessions()
+
+    def _delete_sandbox_session(self, session_id: str):
+        self.sandbox_sessions.pop(session_id, None)
+        self._save_sandbox_sessions()
+
+    async def _cleanup_expired_sessions(self):
+        now = time.time()
+        cutoff = now - DEFAULT_SESSION_RETENTION_HOURS * 3600
+        expired_session_ids = {
+            session_id
+            for session_id, last_access in self.session_last_access.items()
+            if last_access < cutoff
+        }
+        expired_session_ids.update(
+            session_id
+            for session_id, meta in self.sandbox_sessions.items()
+            if float(meta.get("last_active", 0) or 0) < cutoff
+        )
+
+        if not expired_session_ids:
+            return
+
+        for session_id in expired_session_ids:
+            sandbox_meta = self.sandbox_sessions.get(session_id)
+            sandbox_id = (sandbox_meta or {}).get("sandbox_id")
+            if sandbox_id:
+                try:
+                    sandbox = await self._connect_to_existing_sandbox(sandbox_id, timeout=30)
+                    await asyncio.wait_for(sandbox.kill(), timeout=10)
+                except Exception as exc:
+                    logger.warning(f"[E2B] Failed to cleanup expired sandbox {sandbox_id}: {exc}")
+
+            self.session_last_access.pop(session_id, None)
+            self.code_hashes.pop(session_id, None)
+            self.code_hash_timestamps.pop(session_id, None)
+            self.session_files.pop(session_id, None)
+            self.generated_files.pop(session_id, None)
+            self.sent_file_signatures.pop(session_id, None)
+            self.session_locks.pop(session_id, None)
+            self.sandbox_sessions.pop(session_id, None)
+            logger.info(f"[E2B] Cleaned expired session cache: {session_id}")
+
+        self._save_sandbox_sessions()
+
+    async def _get_or_create_session_sandbox(
+        self,
+        event: AstrMessageEvent,
+        template: str = "",
+        timeout: int = DEFAULT_SANDBOX_TIMEOUT,
+        create_if_missing: bool = True,
+    ):
+        session_id = self._get_session_id(event)
+        sandbox_meta = self.sandbox_sessions.get(session_id, {})
+        requested_template = self._effective_template(template)
+        existing_template = str(sandbox_meta.get("template") or "")
+
+        if sandbox_meta.get("sandbox_id"):
+            if requested_template and existing_template and requested_template != existing_template:
+                raise RuntimeError(
+                    "This session already has a sandbox with a different template. "
+                    "Kill the current sandbox before switching templates."
+                )
+
+            sandbox = await self._connect_to_existing_sandbox(
+                sandbox_meta["sandbox_id"],
+                timeout=timeout,
+            )
+            self._update_sandbox_session(
+                session_id,
+                sandbox_meta["sandbox_id"],
+                template=existing_template or requested_template,
+                status="running",
+            )
+            return (
+                sandbox,
+                self.sandbox_sessions[session_id],
+                f"Connected to existing sandbox {sandbox_meta['sandbox_id']}.",
+            )
+
+        if not create_if_missing:
+            return None, {}, ""
+
+        api_key = self.config.get("e2b_api_key", "")
+        proxy = str(self.config.get("proxy", DEFAULT_PROXY) or "").strip()
+        sandbox = await self._create_sandbox(
+            api_key=api_key,
+            timeout=timeout,
+            proxy=proxy,
+            template=requested_template,
+        )
+        sandbox_id = self._extract_sandbox_id(sandbox)
+        if not sandbox_id:
+            raise RuntimeError("Sandbox created, but the SDK did not expose a sandbox ID.")
+
+        self._update_sandbox_session(
+            session_id,
+            sandbox_id,
+            template=requested_template,
+            status="running",
+        )
+        return sandbox, self.sandbox_sessions[session_id], f"Created sandbox {sandbox_id} for this session."
+
+    async def _connect_to_existing_sandbox(self, sandbox_id: str, timeout: int = DEFAULT_SANDBOX_TIMEOUT):
+        if AsyncSandbox is None:
+            raise RuntimeError("AsyncSandbox class not found.")
+
+        connect_method = getattr(AsyncSandbox, "connect", None)
+        if connect_method is None:
+            raise RuntimeError(
+                "Current E2B SDK does not support reconnecting sandboxes. Upgrade the E2B SDK first."
+            )
+
+        api_key = self.config.get("e2b_api_key", "")
+        proxy = str(self.config.get("proxy", DEFAULT_PROXY) or "").strip()
+        connect_kwargs = {
+            "sandbox_id": sandbox_id,
+            "api_key": api_key,
+            "proxy": proxy or None,
+            "timeout": timeout,
+        }
+        return await self._call_sandbox_entrypoint(
+            connect_method,
+            connect_kwargs,
+            call_timeout=20,
+            action_name="connect",
+        )
+
+    async def _call_sandbox_entrypoint(self, method, kwargs, call_timeout: int, action_name: str):
+        filtered_kwargs = {k: v for k, v in kwargs.items() if v is not None}
+        try:
+            signature = inspect.signature(method)
+            if not any(
+                param.kind == inspect.Parameter.VAR_KEYWORD
+                for param in signature.parameters.values()
+            ):
+                filtered_kwargs = {
+                    key: value
+                    for key, value in filtered_kwargs.items()
+                    if key in signature.parameters
+                }
+        except (TypeError, ValueError):
+            pass
+
+        try:
+            result = method(**filtered_kwargs)
+        except TypeError as exc:
+            raise RuntimeError(f"E2B SDK {action_name} call failed: {exc}") from exc
+
+        if inspect.isawaitable(result):
+            return await asyncio.wait_for(result, timeout=call_timeout)
+        return result
+
+    async def _pause_sandbox(self, sandbox):
+        for method_name in ("pause", "beta_pause"):
+            pause_method = getattr(sandbox, method_name, None)
+            if pause_method is None:
+                continue
+            result = pause_method()
+            if inspect.isawaitable(result):
+                await result
+            return method_name
+
+        raise RuntimeError(
+            "Current E2B SDK does not support pause(). Upgrade to a newer E2B SDK with sandbox persistence support."
+        )
+
     @filter.on_llm_request()
     async def inject_file_hint(self, event: AstrMessageEvent, req: ProviderRequest):
+        denied_message = self._get_user_access_denied_message(event)
+        if denied_message:
+            req.system_prompt += (
+                "\n\n[System Notice] The E2B sandbox tools are disabled for this user by user_whitelist. "
+                "Do not call any E2B tools in this conversation."
+            )
+            return
+
         req.system_prompt += (
-            "\n\n[System Notice] The E2B sandbox is ephemeral. Each tool call starts a fresh sandbox, "
-            "and files or variables created in one call will not exist in the next call unless recreated or re-uploaded. "
-            "Do not rely on cross-call state. Do not use top-level return in Python scripts. "
+            "\n\n[System Notice] The E2B sandbox is session-scoped. Reuse the current session sandbox when follow-up work depends on files or variables created earlier. "
+            "Create a sandbox with e2b_sandbox_create when you need one, run code with e2b_sandbox_run_python_code, and explicitly manage lifecycle with "
+            "e2b_sandbox_status, e2b_sandbox_pause, e2b_sandbox_resume, and e2b_sandbox_kill. "
+            "By default e2b_sandbox_run_python_code auto-pauses the sandbox after execution; only pass auto_pause=false when you intentionally need the sandbox to keep running. "
+            "Do not change template mid-session without killing the old sandbox first. Do not use top-level return in Python scripts. "
             "Do not use send_message_to_user to send sandbox file paths such as /home/user/... . "
-            "This plugin will automatically try to return generated files to the user."
+            "When code generates files, this plugin caches candidate files and you should call e2b_sandbox_list_files and e2b_sandbox_send_file to deliver the right one to the user."
         )
 
         pending_files = self._get_pending_files(event)
@@ -365,39 +1039,47 @@ class Main(star.Star):
             "\n\n[System Notice] The current session has cached user files that will be uploaded "
             "to the E2B sandbox before code execution. Prefer reading them from these paths:\n"
             + "\n".join(file_list)
-            + "\n[System Notice] If you want generated files to be sent back to the user, save them under /home/user/uploads/. "
-            "The plugin will also try to detect printed /home/user/... file paths automatically. "
-            "After generating a file, just explain the result to the user. "
+            + "\n[System Notice] If you want generated files to be available for delivery, save them under /home/user/uploads/. "
+            "The plugin will try to detect printed /home/user/... file paths automatically and cache matching outputs. "
+            "After generating a file, use e2b_sandbox_list_files to inspect cached candidates and e2b_sandbox_send_file to send the chosen file. "
             "Do not call send_message_to_user with a file attachment that points to a sandbox path."
         )
 
     async def _create_sandbox(self, api_key: str, timeout: int, proxy: str, template: str = ""):
+        if AsyncSandbox is None:
+            raise RuntimeError("AsyncSandbox class not found.")
+
+        template = str(template or self.config.get("default_template", DEFAULT_TEMPLATE) or "").strip()
         create_kwargs = {
             "api_key": api_key,
             "timeout": timeout,
+            "proxy": proxy or None,
+            "template": template or None,
         }
-        if proxy:
-            create_kwargs["proxy"] = proxy
-        template = str(template or self.config.get("default_template", DEFAULT_TEMPLATE) or "").strip()
-        if template:
-            create_kwargs["template"] = template
 
-        unsupported_options = []
-        if proxy:
-            unsupported_options.append(("proxy", "[E2B] Current SDK does not accept proxy on create(); retrying without it."))
-        if template:
-            unsupported_options.append(("template", "[E2B] Current SDK does not accept template on create(); retrying without it."))
-
-        while True:
+        beta_create = getattr(AsyncSandbox, "beta_create", None)
+        if beta_create is not None:
+            beta_kwargs = dict(create_kwargs)
+            beta_kwargs["auto_pause"] = True
             try:
-                return await asyncio.wait_for(AsyncSandbox.create(**create_kwargs), timeout=20)
-            except TypeError:
-                if not unsupported_options:
-                    raise
-                option_key, warning_text = unsupported_options.pop(0)
-                if option_key in create_kwargs:
-                    logger.warning(warning_text)
-                    create_kwargs.pop(option_key, None)
+                return await self._call_sandbox_entrypoint(
+                    beta_create,
+                    beta_kwargs,
+                    call_timeout=20,
+                    action_name="beta_create",
+                )
+            except Exception as exc:
+                logger.warning(f"[E2B] beta_create() unavailable or failed, falling back to create(): {exc}")
+
+        create_method = getattr(AsyncSandbox, "create", None)
+        if create_method is None:
+            raise RuntimeError("Current E2B SDK does not support sandbox creation.")
+        return await self._call_sandbox_entrypoint(
+            create_method,
+            create_kwargs,
+            call_timeout=20,
+            action_name="create",
+        )
 
     async def _install_dependencies(self, sandbox, packages):
         install_cmd = (
@@ -625,15 +1307,7 @@ class Main(star.Star):
         if not cached_files:
             return []
 
-        first_file = cached_files[0]
-        local_path = Path(first_file["local_path"])
-        signature = first_file.get("signature")
-        if signature not in self.sent_file_signatures[session_id]:
-            await self._send_local_file(event, local_path)
-            if signature:
-                self.sent_file_signatures[session_id].add(signature)
-
-        return [first_file["name"]]
+        return [file_meta["name"] for file_meta in cached_files]
 
     def _build_execution_code(self, code_to_run: str) -> str:
         setup_code = """
@@ -1297,15 +1971,17 @@ except Exception:
         expired_session_ids = [
             session_id
             for session_id, last_access in self.session_last_access.items()
-            if last_access < cutoff
+            if last_access < cutoff and session_id not in self.sandbox_sessions
         ]
 
         for session_id in expired_session_ids:
             self.session_last_access.pop(session_id, None)
             self.code_hashes.pop(session_id, None)
+            self.code_hash_timestamps.pop(session_id, None)
             self.session_files.pop(session_id, None)
             self.generated_files.pop(session_id, None)
             self.sent_file_signatures.pop(session_id, None)
+            self.session_locks.pop(session_id, None)
             logger.info(f"[E2B] Cleaned expired session cache: {session_id}")
 
     def _mark_session_active(self, event: AstrMessageEvent):
@@ -1315,7 +1991,7 @@ except Exception:
             self._cleanup_session_cache()
 
     def _get_export_dir(self):
-        return Path(__file__).resolve().parent / DEFAULT_EXPORT_DIRNAME
+        return self._plugin_data_dir / DEFAULT_EXPORT_DIRNAME
 
     def _sanitize_filename(self, file_name: str):
         name = os.path.basename(file_name).strip() or "exported_file"
@@ -1334,7 +2010,11 @@ except Exception:
             return None
 
     def _get_session_id(self, event: AstrMessageEvent):
-        return getattr(event, "session_id", event.get_sender_id())
+        return (
+            getattr(event, "unified_msg_origin", None)
+            or getattr(event, "session_id", None)
+            or event.get_sender_id()
+        )
 
     def _stringify_output(self, value):
         if value is None:
