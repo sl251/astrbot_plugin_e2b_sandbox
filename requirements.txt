@@ -1,1 +1,1 @@
-e2b-code-interpreter>=2.2.2,<3.0.0
+e2b-code-interpreter>=2.3.0,<3.0.0

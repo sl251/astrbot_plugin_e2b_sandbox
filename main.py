@@ -12,10 +12,13 @@ import tempfile
 import time
 import traceback
 import urllib.request
+import uuid
 import base64 as py_base64
 import zipfile
 from collections import defaultdict
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from functools import wraps
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -25,6 +28,8 @@ from astrbot.api import FunctionTool, logger, star
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import Image
 from astrbot.api.provider import ProviderRequest
+
+from .runtime_capacity import RuntimeCapacity, SandboxBusyError
 
 try:
     from astrbot.core.utils.astrbot_path import get_astrbot_data_path
@@ -38,6 +43,11 @@ except ImportError:
         from e2b import AsyncSandbox
     except ImportError:
         AsyncSandbox = None
+
+try:
+    from e2b import SandboxQuery, SandboxState
+except ImportError:
+    SandboxQuery = SandboxState = None
 
 
 DEFAULT_EXEC_TIMEOUT = 60
@@ -55,6 +65,12 @@ DEFAULT_FILE_RETENTION_HOURS = 24
 DEFAULT_SESSION_RETENTION_HOURS = 12
 DEFAULT_SANDBOX_TIMEOUT = 600
 DEFAULT_DUPLICATE_EXEC_WINDOW_SECONDS = 10
+DEFAULT_MAX_RUNNING_SANDBOXES = 3
+DEFAULT_MAX_QUEUE_SIZE = 10
+DEFAULT_QUEUE_WAIT_TIMEOUT = 15
+DEFAULT_IDLE_PAUSE_SECONDS = 30
+DEFAULT_PAUSED_RETENTION_HOURS = 12
+SANDBOX_API_TIMEOUT = 20
 PLUGIN_NAME = "astrbot_plugin_e2b_sandbox"
 SANDBOX_PATH_PATTERN = re.compile(r"(/home/user(?:/[\w\-. \u4e00-\u9fff]+)+)")
 
@@ -73,6 +89,19 @@ IMPORT_PACKAGE_MAP = {
     "sklearn": "scikit-learn",
     "wordcloud": "wordcloud",
 }
+
+
+def sandbox_action(method):
+    @wraps(method)
+    async def wrapped(self, *args, **kwargs):
+        try:
+            return await method(self, *args, **kwargs)
+        except SandboxBusyError as exc:
+            return f"Busy: {exc} Do not retry immediately in this turn."
+        except Exception as exc:
+            logger.error(f"[E2B] {method.__name__} failed: {traceback.format_exc()}")
+            return f"Error: {exc}"
+    return wrapped
 
 
 @dataclass
@@ -262,7 +291,7 @@ class SendFileTool(FunctionTool):
                     "description": "Exact cached file name to send.",
                 },
                 "file_index": {
-                    "type": "number",
+                    "type": "integer",
                     "description": "1-based index from e2b_sandbox_list_files when the file name is unknown.",
                 },
             },
@@ -290,7 +319,242 @@ class Main(star.Star):
         self._plugin_data_dir = self._get_plugin_data_dir()
         self._sandbox_state_path = self._plugin_data_dir / "sandbox_sessions.json"
         self._load_sandbox_sessions()
+        self._capacity = RuntimeCapacity(
+            occupied=(
+                session_id for session_id, meta in self.sandbox_sessions.items()
+                if meta.get("status") != "paused"
+            )
+        )
+        self._creation_lock = asyncio.Lock()
+        self._next_creation_time = 0.0
+        self._maintenance_task = None
+        self._cleanup_tasks = set()
+        self._session_cleanup_tasks = {}
+        self._last_expired_cleanup = None
+        self._stopping = False
         self._register_llm_tools()
+
+    async def initialize(self):
+        self._start_maintenance()
+
+    async def terminate(self):
+        self._stopping = True
+        if self._maintenance_task:
+            self._maintenance_task.cancel()
+            await asyncio.gather(self._maintenance_task, return_exceptions=True)
+        if self._cleanup_tasks:
+            await asyncio.gather(*self._cleanup_tasks, return_exceptions=True)
+        # Keep durable records when cleanup fails, so reloads do not forget a running VM.
+        for session_id in list(self.sandbox_sessions):
+            lock = self._get_session_lock(session_id)
+            if lock.locked():
+                continue
+            async with lock:
+                await self._pause_session_safely(session_id)
+
+    def _start_maintenance(self):
+        if not self._stopping and (
+            self._maintenance_task is None or self._maintenance_task.done()
+        ):
+            self._maintenance_task = asyncio.create_task(self._maintenance_loop())
+
+    @asynccontextmanager
+    async def _session_operation(self, session_id):
+        if self._stopping:
+            raise SandboxBusyError("Plugin is shutting down.")
+        self._start_maintenance()
+        lock = self._get_session_lock(session_id)
+        if lock.locked() or self._has_pending_cleanup(session_id):
+            raise SandboxBusyError("Another sandbox operation is active in this session.")
+        async with lock:
+            yield
+
+    def _has_pending_cleanup(self, session_id):
+        task = self._session_cleanup_tasks.get(session_id)
+        return task is not None and not task.done()
+
+    async def _configure_capacity(self):
+        await self._capacity.configure(
+            self._safe_int(self.config.get("max_running_sandboxes"), DEFAULT_MAX_RUNNING_SANDBOXES, minimum=1, maximum=20),
+            self._safe_int(self.config.get("max_queue_size"), DEFAULT_MAX_QUEUE_SIZE, minimum=0, maximum=100),
+            self._safe_int(self.config.get("queue_wait_timeout"), DEFAULT_QUEUE_WAIT_TIMEOUT, minimum=1, maximum=120),
+        )
+
+    async def _maintenance_loop(self):
+        while True:
+            try:
+                await self._maintain_sessions()
+            except Exception:
+                logger.warning(f"[E2B] Maintenance failed: {traceback.format_exc()}")
+            await asyncio.sleep(5)
+
+    async def _maintain_sessions(self):
+        idle_seconds = self._safe_int(
+            self.config.get("idle_pause_seconds"), DEFAULT_IDLE_PAUSE_SECONDS,
+            minimum=5, maximum=3600,
+        )
+        now = time.time()
+        for session_id, meta in list(self.sandbox_sessions.items()):
+            if meta.get("status") == "paused":
+                continue
+            lock = self._get_session_lock(session_id)
+            if lock.locked() or self._has_pending_cleanup(session_id):
+                continue
+            if meta.get("status") == "running" and now - meta.get("last_active", now) < idle_seconds:
+                continue
+            async with lock:
+                await self._pause_session_safely(session_id)
+        await self._cleanup_expired_sessions()
+
+    def _sdk_options(self):
+        return {
+            "api_key": self.config.get("e2b_api_key", ""),
+            "proxy": str(self.config.get("proxy", DEFAULT_PROXY) or "").strip() or None,
+        }
+
+    def _is_sandbox_not_found(self, exc):
+        return (
+            self._api_error_status(exc) == 404
+            or type(exc).__name__ in ("NotFoundException", "SandboxNotFoundException", "SandboxNotFoundError")
+        )
+
+    def _is_activation_rejected(self, exc):
+        return (
+            getattr(exc, "activation_rejected", False)
+            or self._api_error_status(exc) in (400, 401, 402, 403, 404, 409, 422, 429)
+            or type(exc).__name__ in (
+                "AuthenticationException", "RateLimitException", "InvalidArgumentException",
+            )
+        )
+
+    def _api_error_status(self, exc):
+        status = getattr(exc, "status_code", None)
+        if status is not None:
+            return status
+        match = re.match(r"^(\d{3}):", str(exc))
+        return int(match.group(1)) if match else None
+
+    async def _pause_session_safely(self, session_id, sandbox=None):
+        meta = self.sandbox_sessions.get(session_id)
+        if not meta:
+            return True
+        if meta.get("status") == "paused":
+            await self._capacity.release(session_id)
+            return True
+        try:
+            if not meta.get("sandbox_id"):
+                await self._recover_uncertain_sandbox(session_id)
+                meta = self.sandbox_sessions[session_id]
+            if sandbox is None:
+                pause_method = getattr(AsyncSandbox, "pause", None) or getattr(AsyncSandbox, "beta_pause", None)
+                if pause_method is None:
+                    raise RuntimeError("The E2B SDK does not support pausing a sandbox by ID.")
+                await self._call_sandbox_entrypoint(
+                    pause_method, {"sandbox_id": meta["sandbox_id"], **self._sdk_options()},
+                    SANDBOX_API_TIMEOUT, "pause",
+                )
+            else:
+                await asyncio.wait_for(self._pause_sandbox(sandbox), SANDBOX_API_TIMEOUT)
+            meta["status"] = "paused"
+            meta["paused_at"] = time.time()
+            self._save_sandbox_sessions()
+            await self._capacity.release(session_id)
+            return True
+        except Exception as exc:
+            if self._is_sandbox_not_found(exc):
+                self._delete_sandbox_session(session_id)
+                await self._capacity.release(session_id)
+                return True
+            meta["status"] = "unknown"
+            self._save_sandbox_sessions()
+            logger.warning(f"[E2B] Pause not confirmed for {session_id}; slot retained: {exc}")
+            return False
+
+    async def _finish_pause(self, session_id, sandbox=None):
+        if self._has_pending_cleanup(session_id):
+            return await asyncio.shield(self._session_cleanup_tasks[session_id])
+        task = asyncio.create_task(self._pause_session_safely(session_id, sandbox))
+        self._session_cleanup_tasks[session_id] = task
+        self._cleanup_tasks.add(task)
+        def finished(completed):
+            self._cleanup_tasks.discard(completed)
+            if self._session_cleanup_tasks.get(session_id) is completed:
+                self._session_cleanup_tasks.pop(session_id, None)
+        task.add_done_callback(finished)
+        return await asyncio.shield(task)
+
+    async def _recover_uncertain_sandbox(self, session_id):
+        """Find a create whose response was lost, without issuing another create."""
+        meta = self.sandbox_sessions[session_id]
+        request_id = meta.get("request_id")
+        if not request_id or AsyncSandbox is None or SandboxQuery is None or not hasattr(AsyncSandbox, "list"):
+            raise RuntimeError("Sandbox activation is unconfirmed; its slot is retained for cleanup.")
+        paginator = AsyncSandbox.list(
+            query=SandboxQuery(
+                metadata={"plugin": PLUGIN_NAME, "request_id": request_id},
+                state=[SandboxState.RUNNING, SandboxState.PAUSED],
+            ),
+            **{k: v for k, v in self._sdk_options().items() if v is not None},
+        )
+        if inspect.isawaitable(paginator):
+            paginator = await asyncio.wait_for(paginator, SANDBOX_API_TIMEOUT)
+        matches = []
+        for _ in range(10):
+            if not getattr(paginator, "has_next", False):
+                break
+            matches.extend(await asyncio.wait_for(paginator.next_items(), SANDBOX_API_TIMEOUT))
+            if matches:
+                break
+        if not matches:
+            raise RuntimeError("Sandbox activation is unconfirmed; retry cleanup later.")
+        meta["sandbox_id"] = str(matches[0].sandbox_id)
+        self._save_sandbox_sessions()
+
+    async def _kill_sandbox_by_id(self, session_id):
+        meta = self.sandbox_sessions.get(session_id)
+        if not meta:
+            await self._capacity.release(session_id)
+            return
+        if not meta.get("sandbox_id"):
+            await self._recover_uncertain_sandbox(session_id)
+        try:
+            await self._call_sandbox_entrypoint(
+                AsyncSandbox.kill, {"sandbox_id": meta["sandbox_id"], **self._sdk_options()},
+                SANDBOX_API_TIMEOUT, "kill",
+            )
+        except Exception as exc:
+            if not self._is_sandbox_not_found(exc):
+                # A failed DELETE must not remove the only durable handle to this VM.
+                raise
+        self._delete_sandbox_session(session_id)
+        await self._capacity.release(session_id)
+
+    async def _refresh_session_state(self, session_id):
+        meta = self.sandbox_sessions.get(session_id)
+        if not meta:
+            return
+        if not meta.get("sandbox_id"):
+            await self._recover_uncertain_sandbox(session_id)
+        try:
+            info = await self._call_sandbox_entrypoint(
+                AsyncSandbox.get_info, {"sandbox_id": meta["sandbox_id"], **self._sdk_options()},
+                SANDBOX_API_TIMEOUT, "get_info",
+            )
+        except Exception as exc:
+            if self._is_sandbox_not_found(exc):
+                self._delete_sandbox_session(session_id)
+                await self._capacity.release(session_id)
+                return
+            raise
+        state = getattr(info.state, "value", info.state)
+        if state == "paused":
+            meta["status"] = "paused"
+            meta.setdefault("paused_at", time.time())
+            await self._capacity.release(session_id)
+        elif state == "running":
+            meta["status"] = "running"
+            self._capacity.occupied.add(session_id)
+        self._save_sandbox_sessions()
 
     def _register_llm_tools(self):
         tools = [
@@ -328,6 +592,7 @@ class Main(star.Star):
         )
         logger.info(f"[E2B] Cached file metadata: {self.session_files[session_id]}")
 
+    @sandbox_action
     async def run_python_code(
         self,
         event: AstrMessageEvent,
@@ -338,12 +603,12 @@ class Main(star.Star):
         """在 E2B 云沙箱中执行 Python 代码。
 
         重要说明：
-        1. 每次调用都会创建一个全新的沙箱环境。
+        1. 同一个会话复用持久沙箱，需要时才创建或恢复。
         2. 支持常见 Python 库与联网请求。
         3. 支持绘图，图片会自动发送给用户。
         4. 如果当前会话里有用户刚发送的文件，插件会尝试自动上传到沙箱。
         5. 需要处理附件时，请优先从 /home/user/uploads/ 读取文件。
-        6. 如果要把生成的文件自动发回用户，请把文件保存到 /home/user/uploads/。
+        6. 生成的文件会缓存，使用 list_files / send_file 选择并发送。
         7. 不要在顶层脚本里使用 return，直接 print 结果即可。
 
         Args:
@@ -362,20 +627,6 @@ class Main(star.Star):
         session_id = self._get_session_id(event)
         await self._cleanup_expired_sessions()
         self._mark_session_active(event)
-        pending_files = self._get_pending_files(event)
-        hash_source = json.dumps(
-            {"code": code_to_run, "files": pending_files},
-            ensure_ascii=False,
-            sort_keys=True,
-        )
-        current_hash = hashlib.md5(hash_source.encode("utf-8")).hexdigest()
-
-        if self._is_duplicate_execution(session_id, current_hash):
-            logger.warning(f"[E2B] Duplicate execution intercepted for session {session_id}")
-            return "SYSTEM WARNING: Duplicate code execution intercepted."
-        self.code_hashes[session_id] = current_hash
-        self.code_hash_timestamps[session_id] = time.time()
-        self.generated_files[session_id] = []
 
         api_key = self.config.get("e2b_api_key", "")
         if not api_key:
@@ -398,15 +649,28 @@ class Main(star.Star):
         streamed_stderr = []
         streamed_results = []
         before_snapshot = {}
+        completed = False
+        auto_pause = auto_pause is not False or self.config.get("allow_keep_running", False) is not True
 
-        async with self._get_session_lock(session_id):
+        async with self._session_operation(session_id):
             try:
+                pending_files = self._get_pending_files(event)
+                hash_source = json.dumps(
+                    {"code": code_to_run, "files": pending_files},
+                    ensure_ascii=False, sort_keys=True,
+                )
+                current_hash = hashlib.md5(hash_source.encode("utf-8")).hexdigest()
+                if self._is_duplicate_execution(session_id, current_hash):
+                    return "SYSTEM WARNING: Duplicate code execution intercepted."
                 sandbox, sandbox_meta, sandbox_notice = await self._get_or_create_session_sandbox(
                     event=event,
                     template=template,
                     timeout=sandbox_lifespan,
                     create_if_missing=True,
                 )
+                self.code_hashes[session_id] = current_hash
+                self.code_hash_timestamps[session_id] = time.time()
+                self.generated_files[session_id] = []
                 if sandbox_notice:
                     llm_feedback.append(f"[System Notification] {sandbox_notice}")
 
@@ -493,20 +757,18 @@ class Main(star.Star):
 
                 pause_summary = "Sandbox kept running."
                 if auto_pause:
-                    pause_method = await self._pause_sandbox(sandbox)
-                    self._update_sandbox_session(
-                        session_id,
-                        sandbox_meta["sandbox_id"],
-                        template=sandbox_meta.get("template", ""),
-                        status="paused",
+                    paused = await self._finish_pause(session_id, sandbox)
+                    pause_summary = (
+                        "Sandbox auto-paused."
+                        if paused else "Pause unconfirmed; the running slot is retained and cleanup will retry."
                     )
-                    pause_summary = f"Sandbox auto-paused with {pause_method}."
 
                 result_text = "\n\n".join(part for part in llm_feedback if part).strip()
                 if not result_text:
                     result_text = "Code executed successfully (no visible output)."
                 result_text = self._truncate(result_text, output_limit)
 
+                completed = True
                 return (
                     f"{result_text}\n\n"
                     "--------------------------------------------------\n"
@@ -515,22 +777,26 @@ class Main(star.Star):
                     "2. If files were generated, they are cached locally in this session.\n"
                     "3. Call e2b_sandbox_list_files to inspect candidates and e2b_sandbox_send_file to deliver the chosen file.\n"
                     f"4. {pause_summary}\n"
-                    "5. Pass auto_pause=false only when you intentionally want the sandbox to remain running after this execution.\n"
+                    "5. Keeping a sandbox running requires allow_keep_running=true in plugin settings; idle sandboxes are still auto-paused.\n"
                     "6. Use e2b_sandbox_status, e2b_sandbox_pause, e2b_sandbox_resume, or e2b_sandbox_kill to control lifecycle explicitly.\n"
                     "7. DO NOT call send_message_to_user with /home/user/... sandbox file paths.\n"
                     "8. Explain the result to the user now.]"
                 )
             except asyncio.CancelledError:
-                logger.warning(
-                    "[E2B] Task cancelled by AstrBot Core. Sandbox kept for manual lifecycle control."
-                )
+                logger.warning("[E2B] Task cancelled; attempting to pause the sandbox.")
+                raise
+            except SandboxBusyError:
                 raise
             except asyncio.TimeoutError:
                 return f"Error: Execution timed out (>{exec_timeout}s)."
             except Exception as exc:
                 logger.error(f"[E2B] Execution Exception: {traceback.format_exc()}")
                 return f"Runtime Error: {exc}"
+            finally:
+                if sandbox is not None and not completed:
+                    await self._finish_pause(session_id, sandbox)
 
+    @sandbox_action
     async def create_session_sandbox(self, event: AstrMessageEvent, template: str = ""):
         denied_message = self._get_user_access_denied_message(event)
         if denied_message:
@@ -540,7 +806,7 @@ class Main(star.Star):
         await self._cleanup_expired_sessions()
         self._mark_session_active(event)
 
-        async with self._get_session_lock(session_id):
+        async with self._session_operation(session_id):
             _, sandbox_meta, notice = await self._get_or_create_session_sandbox(
                 event=event,
                 template=template,
@@ -555,6 +821,7 @@ class Main(star.Star):
                 f"Template: {sandbox_meta.get('template') or '(default)'}"
             )
 
+    @sandbox_action
     async def resume_session_sandbox(self, event: AstrMessageEvent):
         denied_message = self._get_user_access_denied_message(event)
         if denied_message:
@@ -564,7 +831,7 @@ class Main(star.Star):
         await self._cleanup_expired_sessions()
         self._mark_session_active(event)
 
-        async with self._get_session_lock(session_id):
+        async with self._session_operation(session_id):
             sandbox, sandbox_meta, notice = await self._get_or_create_session_sandbox(
                 event=event,
                 timeout=DEFAULT_SANDBOX_TIMEOUT,
@@ -578,6 +845,7 @@ class Main(star.Star):
                 "Status: running"
             )
 
+    @sandbox_action
     async def pause_session_sandbox(self, event: AstrMessageEvent):
         denied_message = self._get_user_access_denied_message(event)
         if denied_message:
@@ -587,30 +855,24 @@ class Main(star.Star):
         await self._cleanup_expired_sessions()
         self._mark_session_active(event)
 
-        async with self._get_session_lock(session_id):
+        async with self._session_operation(session_id):
             sandbox_meta = self.sandbox_sessions.get(session_id)
-            if not sandbox_meta or not sandbox_meta.get("sandbox_id"):
+            if not sandbox_meta:
                 return "No sandbox exists for this session."
             if sandbox_meta.get("status") == "paused":
                 return f"Sandbox is already paused.\nSandbox ID: {sandbox_meta['sandbox_id']}"
 
-            sandbox = await self._connect_to_existing_sandbox(
-                sandbox_meta["sandbox_id"],
-                timeout=DEFAULT_SANDBOX_TIMEOUT,
-            )
-            pause_method = await self._pause_sandbox(sandbox)
-            self._update_sandbox_session(
-                session_id,
-                sandbox_meta["sandbox_id"],
-                template=sandbox_meta.get("template", ""),
-                status="paused",
-            )
+            if not await self._finish_pause(session_id):
+                return "Error: Pause could not be confirmed. The slot is retained and cleanup will retry."
+            if session_id not in self.sandbox_sessions:
+                return "Sandbox no longer exists; its local record was removed."
             return (
-                f"Sandbox paused with {pause_method}.\n"
+                "Sandbox paused.\n"
                 f"Sandbox ID: {sandbox_meta['sandbox_id']}\n"
                 "State is preserved and can be resumed later."
             )
 
+    @sandbox_action
     async def kill_session_sandbox(self, event: AstrMessageEvent):
         denied_message = self._get_user_access_denied_message(event)
         if denied_message:
@@ -620,22 +882,15 @@ class Main(star.Star):
         await self._cleanup_expired_sessions()
         self._mark_session_active(event)
 
-        async with self._get_session_lock(session_id):
+        async with self._session_operation(session_id):
             sandbox_meta = self.sandbox_sessions.get(session_id)
-            if not sandbox_meta or not sandbox_meta.get("sandbox_id"):
+            if not sandbox_meta:
                 return "No sandbox exists for this session."
 
-            try:
-                sandbox = await self._connect_to_existing_sandbox(
-                    sandbox_meta["sandbox_id"],
-                    timeout=DEFAULT_SANDBOX_TIMEOUT,
-                )
-                await asyncio.wait_for(sandbox.kill(), timeout=10)
-            except Exception as exc:
-                logger.warning(f"[E2B] Failed to kill sandbox {sandbox_meta['sandbox_id']}: {exc}")
-            self._delete_sandbox_session(session_id)
+            await self._kill_sandbox_by_id(session_id)
             return f"Sandbox killed.\nSandbox ID: {sandbox_meta['sandbox_id']}"
 
+    @sandbox_action
     async def get_session_sandbox_status(self, event: AstrMessageEvent):
         denied_message = self._get_user_access_denied_message(event)
         if denied_message:
@@ -645,6 +900,8 @@ class Main(star.Star):
         await self._cleanup_expired_sessions()
         self._mark_session_active(event)
 
+        async with self._session_operation(session_id):
+            await self._refresh_session_state(session_id)
         sandbox_meta = self.sandbox_sessions.get(session_id)
         if not sandbox_meta or not sandbox_meta.get("sandbox_id"):
             return "No sandbox exists for this session."
@@ -708,13 +965,21 @@ class Main(star.Star):
                     selected = file_meta
                     break
 
-        if selected is None and file_index:
-            idx = self._safe_int(file_index, 0, minimum=1, maximum=len(generated_files))
-            if idx:
-                selected = generated_files[idx - 1]
+        if normalized_name and selected is None:
+            return "Error: Requested file name was not found. Call e2b_sandbox_list_files for available names."
+        if not normalized_name and file_index != 0:
+            try:
+                idx = int(file_index)
+                if isinstance(file_index, bool) or idx != float(file_index) or not 1 <= idx <= len(generated_files):
+                    raise ValueError
+            except (TypeError, ValueError, OverflowError):
+                return "Error: Invalid file index. Call e2b_sandbox_list_files for valid indices."
+            selected = generated_files[idx - 1]
 
-        if selected is None:
+        if selected is None and len(generated_files) == 1:
             selected = generated_files[0]
+        if selected is None:
+            return "Error: Multiple files are available. Specify a file name or index from e2b_sandbox_list_files."
 
         local_path = Path(selected["local_path"])
         if not local_path.exists():
@@ -786,6 +1051,8 @@ class Main(star.Star):
         )
 
     def _is_user_allowed(self, event: AstrMessageEvent):
+        if self.config.get("enable_user_whitelist", True) is False:
+            return True
         whitelist = self._normalize_user_whitelist()
         if not whitelist:
             return False
@@ -826,12 +1093,15 @@ class Main(star.Star):
         sandbox_id: str,
         template: str = "",
         status: str = "running",
+        request_id: str = "",
     ):
+        previous = self.sandbox_sessions.get(session_id, {})
         self.sandbox_sessions[session_id] = {
             "sandbox_id": str(sandbox_id),
             "template": str(template or ""),
             "status": status,
             "last_active": time.time(),
+            "request_id": request_id or previous.get("request_id", ""),
         }
         self._save_sandbox_sessions()
 
@@ -840,41 +1110,49 @@ class Main(star.Star):
         self._save_sandbox_sessions()
 
     async def _cleanup_expired_sessions(self):
+        if self._last_expired_cleanup is not None and time.monotonic() - self._last_expired_cleanup < 60:
+            return
+        self._last_expired_cleanup = time.monotonic()
         now = time.time()
         cutoff = now - DEFAULT_SESSION_RETENTION_HOURS * 3600
+        paused_cutoff = now - self._safe_int(
+            self.config.get("paused_sandbox_retention_hours"), DEFAULT_PAUSED_RETENTION_HOURS,
+            minimum=1, maximum=720,
+        ) * 3600
         expired_session_ids = {
-            session_id
-            for session_id, last_access in self.session_last_access.items()
-            if last_access < cutoff
+            session_id for session_id in self.session_last_access.keys() | self.sandbox_sessions.keys()
+            if (
+                session_id not in self.sandbox_sessions
+                and self.session_last_access.get(session_id, 0) < cutoff
+            ) or (
+                self.sandbox_sessions.get(session_id, {}).get("status") == "paused"
+                and self.sandbox_sessions[session_id].get(
+                    "paused_at", self.sandbox_sessions[session_id].get("last_active", 0)
+                ) < paused_cutoff
+            )
         }
-        expired_session_ids.update(
-            session_id
-            for session_id, meta in self.sandbox_sessions.items()
-            if float(meta.get("last_active", 0) or 0) < cutoff
-        )
 
         if not expired_session_ids:
             return
 
         for session_id in expired_session_ids:
-            sandbox_meta = self.sandbox_sessions.get(session_id)
-            sandbox_id = (sandbox_meta or {}).get("sandbox_id")
-            if sandbox_id:
+            lock = self._get_session_lock(session_id)
+            if lock.locked() or self._has_pending_cleanup(session_id):
+                continue
+            async with lock:
                 try:
-                    sandbox = await self._connect_to_existing_sandbox(sandbox_id, timeout=30)
-                    await asyncio.wait_for(sandbox.kill(), timeout=10)
+                    await self._kill_sandbox_by_id(session_id)
                 except Exception as exc:
-                    logger.warning(f"[E2B] Failed to cleanup expired sandbox {sandbox_id}: {exc}")
-
-            self.session_last_access.pop(session_id, None)
-            self.code_hashes.pop(session_id, None)
-            self.code_hash_timestamps.pop(session_id, None)
-            self.session_files.pop(session_id, None)
-            self.generated_files.pop(session_id, None)
-            self.sent_file_signatures.pop(session_id, None)
+                    logger.warning(f"[E2B] Expired sandbox cleanup unconfirmed for {session_id}: {exc}")
+                    continue
+                self.session_last_access.pop(session_id, None)
+                self.code_hashes.pop(session_id, None)
+                self.code_hash_timestamps.pop(session_id, None)
+                self.session_files.pop(session_id, None)
+                self.generated_files.pop(session_id, None)
+                self.sent_file_signatures.pop(session_id, None)
+                logger.info(f"[E2B] Cleaned expired session cache: {session_id}")
             self.session_locks.pop(session_id, None)
-            self.sandbox_sessions.pop(session_id, None)
-            logger.info(f"[E2B] Cleaned expired session cache: {session_id}")
 
         self._save_sandbox_sessions()
 
@@ -890,6 +1168,12 @@ class Main(star.Star):
         requested_template = self._effective_template(template)
         existing_template = str(sandbox_meta.get("template") or "")
 
+        if not self.config.get("e2b_api_key") or AsyncSandbox is None:
+            raise RuntimeError("E2B API Key or AsyncSandbox SDK is missing.")
+        await self._configure_capacity()
+        if sandbox_meta and not sandbox_meta.get("sandbox_id"):
+            await self._recover_uncertain_sandbox(session_id)
+
         if sandbox_meta.get("sandbox_id"):
             if requested_template and existing_template and requested_template != existing_template:
                 raise RuntimeError(
@@ -897,36 +1181,64 @@ class Main(star.Star):
                     "Kill the current sandbox before switching templates."
                 )
 
-            sandbox = await self._connect_to_existing_sandbox(
-                sandbox_meta["sandbox_id"],
-                timeout=timeout,
-            )
-            self._update_sandbox_session(
-                session_id,
-                sandbox_meta["sandbox_id"],
-                template=existing_template or requested_template,
-                status="running",
-            )
-            return (
-                sandbox,
-                self.sandbox_sessions[session_id],
-                f"Connected to existing sandbox {sandbox_meta['sandbox_id']}.",
-            )
+            await self._capacity.acquire(session_id)
+            try:
+                # Persist before RPC: a cancelled connect may still resume the VM remotely.
+                self._update_sandbox_session(
+                    session_id, sandbox_meta["sandbox_id"], template=existing_template,
+                    status="starting",
+                )
+                sandbox = await self._connect_to_existing_sandbox(
+                    sandbox_meta["sandbox_id"], timeout=timeout,
+                )
+            except BaseException as exc:
+                if self._is_sandbox_not_found(exc):
+                    self._delete_sandbox_session(session_id)
+                    await self._capacity.release(session_id)
+                else:
+                    self.sandbox_sessions[session_id]["status"] = "unknown"
+                    self._save_sandbox_sessions()
+                    await self._finish_pause(session_id)
+                    raise
+            else:
+                self._update_sandbox_session(
+                    session_id, sandbox_meta["sandbox_id"],
+                    template=existing_template, status="running",
+                )
+                return (
+                    sandbox, self.sandbox_sessions[session_id],
+                    f"Connected to existing sandbox {sandbox_meta['sandbox_id']}.",
+                )
 
         if not create_if_missing:
             return None, {}, ""
 
         api_key = self.config.get("e2b_api_key", "")
         proxy = str(self.config.get("proxy", DEFAULT_PROXY) or "").strip()
-        sandbox = await self._create_sandbox(
-            api_key=api_key,
-            timeout=timeout,
-            proxy=proxy,
-            template=requested_template,
-        )
-        sandbox_id = self._extract_sandbox_id(sandbox)
-        if not sandbox_id:
-            raise RuntimeError("Sandbox created, but the SDK did not expose a sandbox ID.")
+        await self._capacity.acquire(session_id)
+        request_id = uuid.uuid4().hex
+        def mark_starting():
+            self._update_sandbox_session(
+                session_id, "", template=requested_template, status="starting", request_id=request_id,
+            )
+        try:
+            sandbox = await self._create_sandbox(
+                api_key=api_key, timeout=timeout, proxy=proxy, template=requested_template,
+                metadata={"plugin": PLUGIN_NAME, "request_id": request_id},
+                on_start=mark_starting,
+            )
+            sandbox_id = self._extract_sandbox_id(sandbox)
+            if not sandbox_id:
+                raise RuntimeError("Sandbox created, but the SDK did not expose a sandbox ID.")
+        except BaseException as exc:
+            if session_id not in self.sandbox_sessions or self._is_activation_rejected(exc):
+                self._delete_sandbox_session(session_id)
+                await self._capacity.release(session_id)
+            else:
+                self.sandbox_sessions[session_id]["status"] = "unknown"
+                self._save_sandbox_sessions()
+                await self._finish_pause(session_id)
+            raise
 
         self._update_sandbox_session(
             session_id,
@@ -977,14 +1289,36 @@ class Main(star.Star):
         except (TypeError, ValueError):
             pass
 
-        try:
-            result = method(**filtered_kwargs)
-        except TypeError as exc:
-            raise RuntimeError(f"E2B SDK {action_name} call failed: {exc}") from exc
+        async def invoke():
+            deadline = time.monotonic() + call_timeout
+            for attempt in range(3):
+                try:
+                    result = method(**filtered_kwargs)
+                    return await result if inspect.isawaitable(result) else result
+                except Exception as exc:
+                    rate_limited = (
+                        self._api_error_status(exc) == 429
+                        or type(exc).__name__ == "RateLimitException"
+                    )
+                    if not rate_limited or attempt == 2:
+                        raise
+                    response = getattr(exc, "response", None)
+                    headers = getattr(exc, "headers", None) or getattr(response, "headers", {})
+                    try:
+                        delay = max(float(headers.get("Retry-After", 1.1 * (attempt + 1))), 1.05)
+                    except (TypeError, ValueError):
+                        delay = 1.1 * (attempt + 1)
+                    if delay >= deadline - time.monotonic():
+                        raise
+                    try:
+                        await asyncio.sleep(delay)
+                    except asyncio.CancelledError as cancelled:
+                        # No RPC is in flight while waiting after an explicit rejection.
+                        cancelled.activation_rejected = True
+                        raise
+            raise RuntimeError(f"E2B SDK {action_name} retry limit reached.")
 
-        if inspect.isawaitable(result):
-            return await asyncio.wait_for(result, timeout=call_timeout)
-        return result
+        return await asyncio.wait_for(invoke(), timeout=call_timeout)
 
     async def _pause_sandbox(self, sandbox):
         for method_name in ("pause", "beta_pause"):
@@ -1014,7 +1348,7 @@ class Main(star.Star):
             "\n\n[System Notice] The E2B sandbox is session-scoped. Reuse the current session sandbox when follow-up work depends on files or variables created earlier. "
             "Create a sandbox with e2b_sandbox_create when you need one, run code with e2b_sandbox_run_python_code, and explicitly manage lifecycle with "
             "e2b_sandbox_status, e2b_sandbox_pause, e2b_sandbox_resume, and e2b_sandbox_kill. "
-            "By default e2b_sandbox_run_python_code auto-pauses the sandbox after execution; only pass auto_pause=false when you intentionally need the sandbox to keep running. "
+            "Code executions auto-pause unless the operator enables allow_keep_running and you pass auto_pause=false. Idle sandboxes still auto-pause. "
             "Do not change template mid-session without killing the old sandbox first. Do not use top-level return in Python scripts. "
             "Do not use send_message_to_user to send sandbox file paths such as /home/user/... . "
             "When code generates files, this plugin caches candidate files and you should call e2b_sandbox_list_files and e2b_sandbox_send_file to deliver the right one to the user."
@@ -1045,7 +1379,10 @@ class Main(star.Star):
             "Do not call send_message_to_user with a file attachment that points to a sandbox path."
         )
 
-    async def _create_sandbox(self, api_key: str, timeout: int, proxy: str, template: str = ""):
+    async def _create_sandbox(
+        self, api_key: str, timeout: int, proxy: str, template: str = "",
+        metadata=None, on_start=None,
+    ):
         if AsyncSandbox is None:
             raise RuntimeError("AsyncSandbox class not found.")
 
@@ -1055,31 +1392,39 @@ class Main(star.Star):
             "timeout": timeout,
             "proxy": proxy or None,
             "template": template or None,
+            "metadata": metadata,
         }
-
-        beta_create = getattr(AsyncSandbox, "beta_create", None)
-        if beta_create is not None:
-            beta_kwargs = dict(create_kwargs)
-            beta_kwargs["auto_pause"] = True
-            try:
-                return await self._call_sandbox_entrypoint(
-                    beta_create,
-                    beta_kwargs,
-                    call_timeout=20,
-                    action_name="beta_create",
-                )
-            except Exception as exc:
-                logger.warning(f"[E2B] beta_create() unavailable or failed, falling back to create(): {exc}")
-
         create_method = getattr(AsyncSandbox, "create", None)
-        if create_method is None:
+        beta_create = getattr(AsyncSandbox, "beta_create", None)
+        supports_lifecycle = False
+        if create_method:
+            try:
+                supports_lifecycle = "lifecycle" in inspect.signature(create_method).parameters
+            except (TypeError, ValueError):
+                pass
+        if supports_lifecycle:
+            create_kwargs["lifecycle"] = {"on_timeout": "pause", "auto_resume": False}
+            method, action_name = create_method, "create"
+        elif beta_create is not None:
+            create_kwargs["auto_pause"] = True
+            method, action_name = beta_create, "beta_create"
+        elif create_method is not None:
+            method, action_name = create_method, "create"
+        else:
             raise RuntimeError("Current E2B SDK does not support sandbox creation.")
-        return await self._call_sandbox_entrypoint(
-            create_method,
-            create_kwargs,
-            call_timeout=20,
-            action_name="create",
-        )
+
+        # Limit initial creates to Hobby's 1/sec, including failed attempts.
+        async with self._creation_lock:
+            delay = self._next_creation_time - time.monotonic()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            self._next_creation_time = time.monotonic() + 1.05
+            if on_start:
+                on_start()
+            # Do not fallback after a timeout/5xx: the first RPC may have created a VM.
+            return await self._call_sandbox_entrypoint(
+                method, create_kwargs, call_timeout=SANDBOX_API_TIMEOUT, action_name=action_name,
+            )
 
     async def _install_dependencies(self, sandbox, packages):
         install_cmd = (
