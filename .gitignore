@@ -24,6 +24,8 @@ wheels/
 venv/
 ENV/
 env/
+.venv/
+.test-tmp/
 
 # IDE
 .vscode/

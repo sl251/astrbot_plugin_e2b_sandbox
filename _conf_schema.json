@@ -29,17 +29,59 @@
     "description": "留空时使用 E2B 默认环境；填写后默认从该模板启动沙箱",
     "default": ""
   },
+  "enable_user_whitelist": {
+    "type": "bool",
+    "title": "启用用户白名单",
+    "description": "开启后仅白名单用户可使用所有 E2B 工具；关闭后所有用户可用，全局容量限制仍生效。",
+    "default": true
+  },
   "user_whitelist": {
     "type": "list",
     "title": "用户白名单",
-    "description": "允许使用插件的用户白名单。请填写用户 ID；留空表示禁用插件。",
+    "description": "允许使用插件的用户 ID。启用白名单时，留空表示禁止所有用户使用。",
     "default": []
+  },
+  "max_running_sandboxes": {
+    "type": "int",
+    "title": "全局最大运行沙箱数",
+    "description": "本插件实例中所有会话合计的运行/待确认沙箱上限（1–20）；暂停的沙箱不占名额。",
+    "default": 3
+  },
+  "max_queue_size": {
+    "type": "int",
+    "title": "最大排队请求数",
+    "description": "容量已满时最多允许等待的请求数（0–100）；0 表示不排队。",
+    "default": 10
+  },
+  "queue_wait_timeout": {
+    "type": "int",
+    "title": "排队等待超时（秒）",
+    "description": "等待运行名额的最长时间（1–120 秒）；超时后返回繁忙。",
+    "default": 15
+  },
+  "allow_keep_running": {
+    "type": "bool",
+    "title": "允许执行后保持运行",
+    "description": "默认关闭，代码执行后强制暂停；开启后才允许模型使用 auto_pause=false。空闲自动暂停仍生效。",
+    "default": false
+  },
+  "idle_pause_seconds": {
+    "type": "int",
+    "title": "沙箱空闲自动暂停（秒）",
+    "description": "创建、恢复或执行完毕后无人使用的沙箱自动暂停（5–3600 秒），正在执行的任务不会被空闲清理中断。",
+    "default": 30
   },
   "max_return_file_size_mb": {
     "type": "int",
     "title": "最大回传文件大小（MB）",
     "description": "允许从沙箱下载并发送给用户的单个生成文件大小上限",
     "default": 5
+  },
+  "paused_sandbox_retention_hours": {
+    "type": "int",
+    "title": "暂停沙箱自动销毁时间（小时）",
+    "description": "后台每分钟检查，暂停超过此时长的沙箱会直接按 ID 销毁（1–720 小时）。销毁后变量和文件无法恢复；重新执行时会创建新沙箱。普通聊天不会延长此时间。",
+    "default": 12
   },
   "file_retention_hours": {
     "type": "int",

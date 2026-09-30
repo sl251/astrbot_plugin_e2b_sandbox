@@ -1,12 +1,12 @@
 name: astrbot_plugin_e2b_sandbox
 author: sl251
-version: "1.2.0"
+version: "1.3.0"
 astrbot_version: ">=4.9.2"
-description: "使用 E2B 云沙箱执行 Python 代码，支持会话级持久沙箱、生命周期控制、文件桥接与模板选择"
+description: "使用 E2B 云沙箱执行 Python 代码，支持可选白名单、全局容量排队、持久会话与自动清理"
 repo: "https://github.com/sl251/astrbot_plugin_e2b_sandbox"
 
 requirements:
-  - e2b-code-interpreter>=2.2.2,<3.0.0
+  - e2b-code-interpreter>=2.3.0,<3.0.0
 
 configs:
   e2b_api_key:
@@ -29,10 +29,38 @@ configs:
     type: str
     default: ""
     description: "默认使用的 E2B Template ID，留空时使用默认环境"
+  enable_user_whitelist:
+    type: bool
+    default: true
+    description: "开启后仅白名单用户可使用所有 E2B 工具；关闭后所有用户可用，全局容量限制仍生效"
   user_whitelist:
     type: list
     default: []
-    description: "允许使用插件的用户白名单，填写用户 ID；留空表示禁用插件"
+    description: "允许使用插件的用户 ID；启用白名单时，留空表示禁止所有用户使用"
+  max_running_sandboxes:
+    type: int
+    default: 3
+    description: "本插件实例中所有会话合计的运行/待确认沙箱上限（1–20）；暂停的沙箱不占名额"
+  max_queue_size:
+    type: int
+    default: 10
+    description: "容量已满时最多允许等待的请求数（0–100）；0 表示不排队"
+  queue_wait_timeout:
+    type: int
+    default: 15
+    description: "等待运行名额的最长时间（1–120 秒）；超时后返回繁忙"
+  allow_keep_running:
+    type: bool
+    default: false
+    description: "默认执行后强制暂停；开启后才允许 auto_pause=false，空闲自动暂停仍生效"
+  idle_pause_seconds:
+    type: int
+    default: 30
+    description: "空闲沙箱自动暂停时间（5–3600 秒）；正在执行的任务不会被空闲清理中断"
+  paused_sandbox_retention_hours:
+    type: int
+    default: 12
+    description: "后台每分钟检查，暂停超过此时长的沙箱会销毁（1–720 小时）；普通聊天不延长时间，销毁后变量和文件无法恢复"
   max_return_file_size_mb:
     type: int
     default: 5
