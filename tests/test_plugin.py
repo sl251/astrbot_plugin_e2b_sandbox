@@ -278,7 +278,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         await self.plugin._maintain_sessions()
         self.assertIn(box.sandbox_id, FakeSDK.boxes)
         self.plugin.config["paused_sandbox_retention_hours"] = 12
-        self.plugin._last_expired_cleanup = 0
+        self.plugin._last_expired_cleanup = None
         await self.plugin._maintain_sessions()
         self.assertNotIn(box.sandbox_id, FakeSDK.boxes)
 
@@ -289,7 +289,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         await self.plugin._maintain_sessions()
         self.assertIn(self.session, self.plugin.sandbox_sessions)
         FakeSDK.kill_error = None
-        self.plugin._last_expired_cleanup = 0
+        self.plugin._last_expired_cleanup = None
         await self.plugin._maintain_sessions()
         self.assertNotIn(box.sandbox_id, FakeSDK.boxes)
 
@@ -299,6 +299,18 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         async with self.plugin._get_session_lock(self.session):
             await self.plugin._maintain_sessions()
         self.assertIn(box.sandbox_id, FakeSDK.boxes)
+
+    async def test_first_expiry_check_runs_even_when_monotonic_clock_is_near_zero(self):
+        box = await self.make_box()
+        self.plugin.sandbox_sessions[self.session]["paused_at"] = time.time() - 13 * 3600
+        with patch.object(main.time, "monotonic", return_value=12):
+            await self.plugin._cleanup_expired_sessions()
+            self.assertNotIn(box.sandbox_id, FakeSDK.boxes)
+            self.assertEqual(self.plugin._last_expired_cleanup, 12)
+            second = await self.make_box(Event("second"))
+            self.plugin.sandbox_sessions["test:friend:second"]["paused_at"] = time.time() - 13 * 3600
+            await self.plugin._cleanup_expired_sessions()
+            self.assertIn(second.sandbox_id, FakeSDK.boxes)
 
     async def test_pause_timestamp_survives_reload(self):
         await self.make_box(state=State.RUNNING)

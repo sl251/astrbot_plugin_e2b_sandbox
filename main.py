@@ -330,7 +330,7 @@ class Main(star.Star):
         self._maintenance_task = None
         self._cleanup_tasks = set()
         self._session_cleanup_tasks = {}
-        self._last_expired_cleanup = 0.0
+        self._last_expired_cleanup = None
         self._stopping = False
         self._register_llm_tools()
 
@@ -1110,7 +1110,7 @@ class Main(star.Star):
         self._save_sandbox_sessions()
 
     async def _cleanup_expired_sessions(self):
-        if time.monotonic() - self._last_expired_cleanup < 60:
+        if self._last_expired_cleanup is not None and time.monotonic() - self._last_expired_cleanup < 60:
             return
         self._last_expired_cleanup = time.monotonic()
         now = time.time()
