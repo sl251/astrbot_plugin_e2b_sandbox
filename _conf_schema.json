@@ -71,6 +71,12 @@
     "hint": "空闲超过此时长自动暂停，范围 5–3600 秒；正在执行的任务不受影响。",
     "default": 30
   },
+  "max_upload_file_size_mb": {
+    "type": "int",
+    "description": "上传文件上限（MB）",
+    "hint": "单个附件上传到沙箱前的大小上限，范围 1–100 MB；同时限制 HTTP(S) 下载和本地附件读取，超限会终止本次执行。",
+    "default": 20
+  },
   "max_return_file_size_mb": {
     "type": "int",
     "description": "回传文件上限（MB）",

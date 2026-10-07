@@ -11,9 +11,7 @@ import shutil
 import tempfile
 import time
 import traceback
-import urllib.request
 import uuid
-import base64 as py_base64
 import zipfile
 from collections import defaultdict
 from contextlib import asynccontextmanager
@@ -30,6 +28,8 @@ from astrbot.api.message_components import Image
 from astrbot.api.provider import ProviderRequest
 
 from .runtime_capacity import RuntimeCapacity, SandboxBusyError
+from .file_transfer import download_http, read_limited
+from .sandbox_bootstrap import FONT_SETUP_CODE
 
 try:
     from astrbot.core.utils.astrbot_path import get_astrbot_data_path
@@ -61,6 +61,7 @@ MAX_RESULT_LIMIT = 20000
 MAX_SESSION_FILE_COUNT = 5
 MAX_GENERATED_FILE_CANDIDATES = 3
 DEFAULT_MAX_RETURN_FILE_SIZE_MB = 5
+DEFAULT_MAX_UPLOAD_FILE_SIZE_MB = 20
 DEFAULT_FILE_RETENTION_HOURS = 24
 DEFAULT_SESSION_RETENTION_HOURS = 12
 DEFAULT_SANDBOX_TIMEOUT = 600
@@ -1655,35 +1656,7 @@ class Main(star.Star):
         return [file_meta["name"] for file_meta in cached_files]
 
     def _build_execution_code(self, code_to_run: str) -> str:
-        setup_code = """
-import os
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-import matplotlib.font_manager as fm
-
-def _configure_font():
-    font_path = '/tmp/SimHei.ttf'
-    if not os.path.exists(font_path):
-        try:
-            os.system('curl -Ls -o /tmp/SimHei.ttf https://github.com/StellarCN/scp_zh/raw/master/fonts/SimHei.ttf > /dev/null 2>&1')
-        except Exception:
-            pass
-
-    if os.path.exists(font_path):
-        try:
-            fm.fontManager.addfont(font_path)
-            plt.rcParams['font.sans-serif'] = ['SimHei']
-            plt.rcParams['axes.unicode_minus'] = False
-        except Exception:
-            pass
-
-try:
-    _configure_font()
-except Exception:
-    pass
-"""
-        return setup_code + "\n" + code_to_run
+        return FONT_SETUP_CODE + "\n" + code_to_run
 
     def _extract_event_files(self, event: AstrMessageEvent):
         files = []
@@ -1884,14 +1857,10 @@ except Exception:
 
     def _resolve_remote_path(self, name: str):
         raw_path = str(name).strip().replace("\\", "/")
-        if raw_path.startswith("/"):
-            normalized = posixpath.normpath(raw_path)
-        else:
-            normalized = posixpath.normpath(posixpath.join(DEFAULT_UPLOAD_DIR, raw_path))
-
-        if normalized in (".", "/"):
-            raise ValueError("Invalid remote file path")
-        return normalized
+        filename = posixpath.basename(raw_path)
+        if filename in ("", ".", "..") or "\x00" in filename:
+            raise ValueError("Invalid attachment filename")
+        return posixpath.join(DEFAULT_UPLOAD_DIR, filename)
 
     def _detect_packages(self, code: str):
         packages = set()
@@ -2006,6 +1975,9 @@ except Exception:
 
             if not content:
                 logger.info(f"[E2B] Skip generated file {file_name}: downloaded content is empty")
+                continue
+            if len(content) > max_bytes or len(content) != file_size:
+                logger.warning(f"[E2B] Skip generated file {file_name}: size changed during download")
                 continue
             if not self._is_valid_generated_file(file_name, content):
                 logger.warning(f"[E2B] Skip generated file {file_name}: integrity validation failed")
@@ -2195,39 +2167,31 @@ except Exception:
         return attrs
 
     def _download_url(self, url: str):
-        try:
-            with urllib.request.urlopen(url, timeout=30) as response:
-                return response.read()
-        except Exception as exc:
-            logger.warning(f"[E2B] Failed to download {url}: {exc}")
-            return None
+        return download_http(url, self._max_upload_bytes())
+
+    def _max_upload_bytes(self):
+        return self._safe_int(
+            self.config.get("max_upload_file_size_mb"), DEFAULT_MAX_UPLOAD_FILE_SIZE_MB,
+            minimum=1, maximum=100,
+        ) * 1024 * 1024
 
     async def _read_sandbox_file_bytes(self, sandbox, remote_path: str):
-        command = (
-            "python - <<'PY'\n"
-            "import base64\n"
-            "from pathlib import Path\n"
-            f"path = Path({json.dumps(remote_path, ensure_ascii=False)})\n"
-            "print(base64.b64encode(path.read_bytes()).decode('ascii'))\n"
-            "PY"
+        content = await asyncio.wait_for(
+            sandbox.files.read(remote_path, format="bytes", request_timeout=30),
+            timeout=30,
         )
-        result = await sandbox.commands.run(command, timeout=30)
-        exit_code = getattr(result, "exit_code", 0)
-        if exit_code not in (0, None):
-            stderr_text = getattr(result, "stderr", "") or getattr(result, "stdout", "")
-            raise RuntimeError(f"Failed to read sandbox file: {stderr_text}".strip())
-
-        stdout = getattr(result, "stdout", "") or ""
-        if isinstance(stdout, list):
-            stdout = "".join(stdout)
-        encoded = str(stdout).strip()
-        if not encoded:
-            return b""
-        return py_base64.b64decode(encoded)
+        if not isinstance(content, (bytes, bytearray, memoryview)):
+            raise TypeError("E2B files.read(format='bytes') returned non-binary content")
+        return bytes(content)
 
     def _read_local_file(self, path: str):
+        if not Path(path).is_file():
+            raise ValueError("Attachment must be a regular file")
         with open(path, "rb") as file_obj:
-            return file_obj.read()
+            max_bytes = self._max_upload_bytes()
+            if os.fstat(file_obj.fileno()).st_size > max_bytes:
+                raise ValueError(f"Attachment exceeds the upload limit ({max_bytes} bytes).")
+            return read_limited(file_obj, max_bytes)
 
     def _is_valid_generated_file(self, file_name: str, content: bytes) -> bool:
         lower_name = file_name.lower()
