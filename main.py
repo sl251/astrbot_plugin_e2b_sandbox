@@ -30,6 +30,7 @@ from astrbot.api.provider import ProviderRequest
 from .runtime_capacity import RuntimeCapacity, SandboxBusyError
 from .file_transfer import download_http, read_limited
 from .sandbox_bootstrap import FONT_SETUP_CODE
+from .execution_policy import apply_execution_policy
 
 try:
     from astrbot.core.utils.astrbot_path import get_astrbot_data_path
@@ -110,8 +111,12 @@ class RunPythonCodeTool(FunctionTool):
     plugin: Any = field(repr=False, default=None)
     name: str = "e2b_sandbox_run_python_code"
     description: str = (
-        "Run Python code inside the current session's E2B sandbox. "
-        "The tool reuses the session sandbox when available and creates one automatically when needed."
+        "Execute Python in an isolated, session-scoped E2B cloud sandbox. "
+        "Prefer this tool for general code execution, calculations, plotting, and user-provided files. "
+        "Access follows the E2B plugin's user policy, independently of AstrBot admin status. "
+        "Automatically creates or reuses the session sandbox. "
+        "For cloud tasks, Python subprocess can execute shell commands inside E2B. "
+        "This environment is not the AstrBot host or another user-specified server."
     )
     parameters: dict = field(
         default_factory=lambda: {
@@ -1337,12 +1342,18 @@ class Main(star.Star):
 
     @filter.on_llm_request()
     async def inject_file_hint(self, event: AstrMessageEvent, req: ProviderRequest):
+        req.system_prompt = req.system_prompt or ""
         denied_message = self._get_user_access_denied_message(event)
         if denied_message:
             req.system_prompt += (
                 "\n\n[System Notice] The E2B sandbox tools are disabled for this user by user_whitelist. "
                 "Do not call any E2B tools in this conversation."
             )
+            return
+
+        if not apply_execution_policy(self.context, event, req, self.config, logger):
+            # E.g. disabled by the persona or delegated exclusively to a sub-agent.
+            # Do not advertise direct calls or cached file access that this agent lacks.
             return
 
         req.system_prompt += (

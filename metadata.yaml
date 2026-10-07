@@ -1,6 +1,6 @@
 name: astrbot_plugin_e2b_sandbox
 author: sl251
-version: "1.3.2"
+version: "1.3.3"
 astrbot_version: ">=4.9.2"
 description: "使用 E2B 云沙箱执行 Python 代码，支持可选白名单、全局容量排队、持久会话与自动清理"
 repo: "https://github.com/sl251/astrbot_plugin_e2b_sandbox"
@@ -29,6 +29,14 @@ configs:
     type: str
     default: ""
     description: "默认使用的 E2B Template ID，留空时使用默认环境"
+  prefer_e2b_for_code:
+    type: bool
+    default: true
+    description: "本轮 E2B 执行工具可用时，提示日常代码优先走云沙箱；不把宿主机任务静默转移到云端"
+  hide_restricted_local_tools:
+    type: bool
+    default: true
+    description: "local 模式要求管理员时，为通过插件准入的非管理员隐藏当前请求的本机执行工具，保留文件工具和原有权限校验"
   enable_user_whitelist:
     type: bool
     default: true

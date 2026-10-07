@@ -29,6 +29,18 @@
     "hint": "留空使用 E2B 默认环境；填写后从指定模板创建沙箱。",
     "default": ""
   },
+  "prefer_e2b_for_code": {
+    "type": "bool",
+    "description": "默认使用云端执行",
+    "hint": "本轮有 E2B 执行工具且用户通过插件准入时，提示日常代码、计算、绘图和附件处理优先使用 E2B；明确针对宿主机的任务仍按宿主机权限处理。",
+    "default": true
+  },
+  "hide_restricted_local_tools": {
+    "type": "bool",
+    "description": "隐藏无权本机执行",
+    "hint": "用户通过插件准入、会话使用 local 且本机执行要求管理员时，对非管理员隐藏当前主 agent 请求中的 Shell、Python 和 Shell 会话工具；保留文件工具及原有权限校验。",
+    "default": true
+  },
   "enable_user_whitelist": {
     "type": "bool",
     "description": "启用用户白名单",

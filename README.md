@@ -55,6 +55,9 @@
 - **v1.3.2** **字体自愈与文件传输加固**
   - 使用可自愈的 Noto 中文字体缓存、SDK 二进制文件回读，新增附件体积及 URL 协议限制。
   - 附件固定写入 uploads 目录；保留群聊共享沙箱，并明确权限与数据共享边界。
+- **v1.3.3** **默认云端执行与本机权限提示**
+  - 日常代码任务默认提示使用 E2B；在 local 模式要求管理员时，为普通用户隐藏主 agent 当前请求中的本机执行工具。
+  - 区分云端与宿主机环境，保留文件工具、管理员能力和原有准入检查。
 
 ---
 
@@ -96,6 +99,8 @@ pip install 'e2b-code-interpreter>=2.3.0,<3.0.0'
 | `max_output_length` | 整数 | 否 | 2000 | 返回给 LLM 的最大文本长度 |
 | `proxy` | 字符串 | 否 | 空 | E2B 请求代理地址 |
 | `default_template` | 字符串 | 否 | 空 | 默认使用的 E2B Template ID |
+| `prefer_e2b_for_code` | 布尔值 | 否 | true | 本轮包含可用 E2B 执行工具时，注入日常代码优先走云端的提示 |
+| `hide_restricted_local_tools` | 布尔值 | 否 | true | 用户通过插件准入、local 模式要求管理员时，为普通用户隐藏当前请求的本机 Shell、Python 和 Shell 会话工具 |
 | `enable_user_whitelist` | 布尔值 | 否 | true | 是否限制为白名单用户；关闭后所有用户可用 |
 | `user_whitelist` | 字符串列表 | 否 | 空 | 允许使用的用户 ID；启用白名单时留空会禁止所有用户 |
 | `max_running_sandboxes` | 整数 | 否 | 3 | 本插件实例中所有会话合计的运行/待确认沙箱上限（1–20） |
@@ -129,6 +134,30 @@ pip install 'e2b-code-interpreter>=2.3.0,<3.0.0'
 自动销毁会永久删除云端沙箱里的变量和文件。超过保留时间后再执行，会创建新沙箱；需要长期保留状态时请调大保留小时数。AstrBot 停止运行时插件无法执行后台清理，重新启动后会继续处理到期记录。E2B 本身不会自动销毁已经暂停的沙箱。
 
 ---
+
+## 默认云端执行与本机权限
+
+v1.3.3 默认开启 `prefer_e2b_for_code` 和 `hide_restricted_local_tools`。插件在 `on_llm_request` 中读取当前会话的 `provider_settings`，不会修改 AstrBot 全局配置：
+
+**不需要开启多 agent 编排**。普通单 agent 安装可直接使用以上功能，不需要 router_system_prompt 或 sandbox_runner；即使没有启用 AstrBot 内置电脑能力，E2B 也可按自身准入规则独立使用。下述多 agent 说明仅适用于选择开启编排的用户。
+
+| 情况 | 行为 |
+|---|---|
+| 通过 E2B 准入，且本轮有 E2B 执行工具 | 提示计算、绘图、通用代码和附件处理直接使用 E2B，无需用户点名云沙箱 |
+| 非管理员，`computer_use_runtime=local` 且 `computer_use_require_admin=true` | 在当前请求的工具集合副本中移除 `astrbot_execute_shell`、`astrbot_execute_python`、`astrbot_shell_session` |
+| 管理员，或管理员要求已关闭 | 保留本机执行工具；普通代码仍可优先用 E2B |
+| 使用内置 sandbox 或 none 模式 | 不按本机工具规则过滤，避免误删内置云沙箱工具 |
+| E2B 工具未分配给主 agent、已禁用，或用户未通过插件准入 | 不宣告本轮可直接使用 E2B；不凭空添加工具或恢复被编排器移除的工具 |
+
+本机文件读写、编辑、搜索和 Skills 相关工具保留，由它们自身的权限和目录限制决定是否可用。工具集合的容器和列表按请求复制，不全局停用工具，也不改写其他用户或子 agent 的工具集合。关闭隐藏选项后，原本的管理员检查仍生效。
+
+**环境必须区分**：E2B 的文件、进程、网络和软件包属于云沙箱；本机路径和 Skills 不会自动出现在云端。明确检查宿主机、Docker、AstrBot 服务或其他服务器时，仍使用目标机器的授权工具，缺少权限就说明原因；不能把云端执行结果当作目标机器结果。仅问“看看环境”而目标不明时，应先确认检查哪台机器。云端 Shell 任务可通过 E2B Python 的 `subprocess` 执行，无需放开本机 Shell 权限。
+
+**可选的多 agent 编排**：日常任务可让主 agent 直接持有 E2B 工具，运维和仓库子 agent 继续负责各自目标。不需要专门添加 sandbox_runner。如果启用“移除主 agent 重复工具”并把 E2B 分配给某个子 agent，主 agent 就不会收到“直接调用 E2B”的提示；插件不覆盖这项编排决定。此请求钩子的过滤不能保证所有子 agent 也已过滤，子 agent 的权限仍由 AstrBot 工具执行检查兜底。插件没有读取或修改编排器配置，也不会创建任何子 agent。
+
+保留 `computer_use_require_admin=true`，无需把内置运行环境切到 sandbox。关闭 `prefer_e2b_for_code` 只关闭本轮默认路由提示，E2B 工具本身的环境说明、生命周期和附件提示仍保留。默认云端是模型选择策略，不是把本机命令拦截后自动转发；工具隐藏也不替代原有权限校验。旧版/第三方宿主接口不兼容时会记录告警并保留原有工具权限机制。
+
+接口与条件已核对 [AstrBot v4.28.1 的 ToolSet](https://github.com/AstrBotDevs/AstrBot/blob/v4.28.1/astrbot/core/agent/tool.py) 和[本机权限检查](https://github.com/AstrBotDevs/AstrBot/blob/v4.28.1/astrbot/core/tools/computer_tools/util.py)。升级后重载插件，并用新对话验证路由，避免旧上下文中的权限报错影响模型选择。
 
 ## 文件传输与中文字体
 
