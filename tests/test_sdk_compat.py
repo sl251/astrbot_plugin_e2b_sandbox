@@ -59,3 +59,17 @@ class SDKCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         paginator = main.AsyncSandbox.list(query=query, api_key="mock")
         self.assertTrue(paginator.has_next)
         self.assertTrue(callable(paginator.next_items))
+
+    async def test_real_filesystem_supports_binary_read_with_timeout(self):
+        from e2b.sandbox_async.filesystem.filesystem import Filesystem
+        from e2b.sandbox_async.filesystem.filesystem import ENVD_DEFAULT_USER
+        # Exercise the installed implementation while mocking only HTTP I/O.
+        fs = Filesystem.__new__(Filesystem)
+        fs._envd_version = ENVD_DEFAULT_USER
+        fs._connection_config = types.SimpleNamespace(get_request_timeout=lambda timeout: timeout)
+        import httpx
+        payload = bytes(range(256))
+        fs._envd_api = types.SimpleNamespace(get=AsyncMock(return_value=httpx.Response(200, content=payload)))
+        result = await self.plugin._read_sandbox_file_bytes(types.SimpleNamespace(files=fs), "/home/user/test.bin")
+        self.assertEqual(result, payload)
+        self.assertEqual(fs._envd_api.get.call_args.kwargs["timeout"], 30)
