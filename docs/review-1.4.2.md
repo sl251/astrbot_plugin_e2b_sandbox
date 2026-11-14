@@ -1,6 +1,23 @@
 # 1.4.2 排查与测试交接
 
-本分支基于 PR #14 的 `8d214d5`，该提交已经包含 1.4.0 模块化、多 Key 以及两次 dashboard 提交（`b64c7ac`、`8d214d5`）。本次没有合并 main 或发布 Release。提交时未运行自动化、浏览器或真实 E2B 测试，下面均为待验证项目。
+本分支基于 PR #14 的 `8d214d5`，该提交已经包含 1.4.0 模块化、多 Key 以及两次 dashboard 提交（`b64c7ac`、`8d214d5`）。本次没有合并 main 或发布 Release。初次提交只做静态检查；本轮已按用户要求补测，结果如下。下表仍保留完整验收要求，不能将替身回归等同于真实宿主或云端验收。
+
+## 2026-11-14 本轮测试结果
+
+原有 136 项测试在四组隔离环境均通过。新增 `tests/test_v142_regressions.py` 的 13 项回归后，重新执行完整测试，四组各 149 项全部通过，无失败或跳过：
+
+| Python | e2b-code-interpreter | e2b | 完整测试 |
+| --- | --- | --- | --- |
+| 3.10.0 | 2.3.0 | 2.6.0 | 149 通过 |
+| 3.10.0 | 2.10.5 | 2.55.1 | 149 通过 |
+| 3.12.11 | 2.3.0 | 2.6.0 | 149 通过 |
+| 3.12.11 | 2.11.10 | 2.64.0 | 149 通过 |
+
+环境为 Windows；最低 SDK 显式固定版本，当前 SDK 按 requirements.txt 分别在对应 Python 环境解析。命令为 `python -m unittest discover -s tests -v`，启用 `PYTHONUTF8=1`。面板桥接和交互的现有 Node 运行测试也包含在完整测试中。
+
+新增测试覆盖非法状态文件原文保留、打开/fsync/替换失败不发送 CREATE、恢复前写盘失败不发送 CONNECT 且不触发补偿暂停、运行会话保留名额、迁移写盘失败停止加载、旧单 Key → 自动归属持久化 → 列表重排后的原 Key 恢复与新会话轮询、暂停计时重置、未知状态、准备阶段重试、销毁后去重清理、卸载等待与拒绝新请求，以及面板重复目标/上限、Key 类型与脱敏。
+
+真实 SDK 用例只替换网络入口；生命周期和迁移使用内存 E2B 服务，未使用真实 API Key 创建沙箱，未运行真实 AstrBot 或浏览器端到端验收。原提交 `31626e2` 的 GitHub CI 四组也已成功；新增测试提交后的 CI 应以该提交的 Checks 为准。
 
 ## 已修复的问题与验收条件
 
@@ -17,7 +34,7 @@
 
 ## 测试模型接手建议
 
-1. 在隔离环境补齐上表回归用例，再运行 `python -m unittest discover -s tests -v`。现有 CI 为 Python 3.10/3.12 × minimum/current SDK；minimum 为 e2b-code-interpreter 2.3.0 与 e2b 2.6.0，current 按 requirements.txt 安装。
+1. 本轮已补齐上述 13 项故障边界和迁移用例，完整测试命令为 `python -m unittest discover -s tests -v`。现有 CI 为 Python 3.10/3.12 × minimum/current SDK；minimum 为 e2b-code-interpreter 2.3.0 与 e2b 2.6.0，current 按 requirements.txt 安装。
 2. 真实 AstrBot 中核对 `register_web_api`、`astrbot.api.web.request`、宿主 JWT 以及页面桥接契约。现有面板测试使用宿主替身，不能证明某个已安装 AstrBot 版本的端到端兼容性。旧宿主应安全显示不可用。
 3. 在支持面板的宿主验收登录/退出、iframe 来源、暂停/销毁二次确认、过期目标拒绝、页面关闭后操作收尾、深浅主题与窄屏显示。
 4. 用真实多账户验收新建轮询、原 Key 恢复、Key 缺失、额度/限流、重载迁移；超时和 5xx 不能跨账户再建。真实云端验收会产生资源消耗，使用测试账户并及时清理。
