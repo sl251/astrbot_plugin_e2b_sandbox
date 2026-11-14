@@ -152,7 +152,7 @@ pip install 'e2b-code-interpreter>=2.3.0,<3.0.0'
 
 如果已经清空旧字段、旧会话又没有归属记录，先把原 Key A 填回 `e2b_api_key` 再重载。不要把新 Key B 当作 A 填进去认领旧沙箱。
 
-1.4.2 当前位于 PR #15 的 `fix/v1.4.2-review` 测试分支；在它合并前，面向主分支的普通插件更新不会获取该版本。
+1.4.2 已合入 `main`，通过 WebUI 的插件更新或重新拉取本仓库即可获取；面板入口在「插件 → astrbot_plugin_e2b_sandbox → dashboard」。
 
 ---
 
