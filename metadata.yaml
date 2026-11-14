@@ -1,8 +1,8 @@
 name: astrbot_plugin_e2b_sandbox
 author: sl251
-version: "1.3.3"
+version: "1.4.0"
 astrbot_version: ">=4.9.2"
-description: "使用 E2B 云沙箱执行 Python 代码，支持可选白名单、全局容量排队、持久会话与自动清理"
+description: "E2B 云沙箱 Python 执行、会话持久化、多 API Key 轮询、容量排队与自动清理"
 repo: "https://github.com/sl251/astrbot_plugin_e2b_sandbox"
 
 requirements:
@@ -13,6 +13,10 @@ configs:
     type: str
     default: ""
     description: "从 https://e2b.dev 获取的 API Key"
+  e2b_api_keys:
+    type: list
+    default: []
+    description: "额外的 E2B API Key；与旧单 Key 配置合并去重，仅对新建沙箱轮询"
   timeout:
     type: int
     default: 60
