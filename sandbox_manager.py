@@ -108,9 +108,13 @@ class SandboxManagerMixin:
                 await self._pause_session_safely(session_id)
         await self._cleanup_expired_sessions()
 
-    def _sdk_options(self):
+    def _sdk_options(self, session_id=None, key_id=None):
+        meta = self.sandbox_sessions.get(session_id, {}) if session_id else {}
+        # Existing VM operations must use the original account, never
+        # the round-robin key selected for the next new VM.
+        owner = key_id or meta.get("key_id")
         return {
-            "api_key": self.config.get("e2b_api_key", ""),
+            "api_key": self._key_pool.resolve(owner),
             "proxy": str(self.config.get("proxy", DEFAULT_PROXY) or "").strip() or None,
         }
 
@@ -152,7 +156,7 @@ class SandboxManagerMixin:
                 if pause_method is None:
                     raise RuntimeError("The E2B SDK does not support pausing a sandbox by ID.")
                 await self._call_sandbox_entrypoint(
-                    pause_method, {"sandbox_id": meta["sandbox_id"], **self._sdk_options()},
+                    pause_method, {"sandbox_id": meta["sandbox_id"], **self._sdk_options(session_id=session_id)},
                     SANDBOX_API_TIMEOUT, "pause",
                 )
             else:
@@ -196,7 +200,7 @@ class SandboxManagerMixin:
                 metadata={"plugin": PLUGIN_NAME, "request_id": request_id},
                 state=[self._sandbox_state.RUNNING, self._sandbox_state.PAUSED],
             ),
-            **{k: v for k, v in self._sdk_options().items() if v is not None},
+            **{k: v for k, v in self._sdk_options(session_id=session_id).items() if v is not None},
         )
         if inspect.isawaitable(paginator):
             paginator = await asyncio.wait_for(paginator, SANDBOX_API_TIMEOUT)
@@ -221,7 +225,7 @@ class SandboxManagerMixin:
             await self._recover_uncertain_sandbox(session_id)
         try:
             await self._call_sandbox_entrypoint(
-                self._sandbox_sdk.kill, {"sandbox_id": meta["sandbox_id"], **self._sdk_options()},
+                self._sandbox_sdk.kill, {"sandbox_id": meta["sandbox_id"], **self._sdk_options(session_id=session_id)},
                 SANDBOX_API_TIMEOUT, "kill",
             )
         except Exception as exc:
@@ -239,7 +243,7 @@ class SandboxManagerMixin:
             await self._recover_uncertain_sandbox(session_id)
         try:
             info = await self._call_sandbox_entrypoint(
-                self._sandbox_sdk.get_info, {"sandbox_id": meta["sandbox_id"], **self._sdk_options()},
+                self._sandbox_sdk.get_info, {"sandbox_id": meta["sandbox_id"], **self._sdk_options(session_id=session_id)},
                 SANDBOX_API_TIMEOUT, "get_info",
             )
         except Exception as exc:
@@ -317,8 +321,8 @@ class SandboxManagerMixin:
         requested_template = self._effective_template(template)
         existing_template = str(sandbox_meta.get("template") or "")
 
-        if not self.config.get("e2b_api_key") or self._sandbox_sdk is None:
-            raise RuntimeError("E2B API Key or self._sandbox_sdk SDK is missing.")
+        if not self._key_pool.has_keys or self._sandbox_sdk is None:
+            raise RuntimeError("E2B API Key or AsyncSandbox SDK is missing.")
         await self._configure_capacity()
         if sandbox_meta and not sandbox_meta.get("sandbox_id"):
             await self._recover_uncertain_sandbox(session_id)
@@ -332,13 +336,13 @@ class SandboxManagerMixin:
 
             await self._capacity.acquire(session_id)
             try:
-                # Persist before RPC: a cancelled connect may still resume the VM remotely.
                 self._update_sandbox_session(
                     session_id, sandbox_meta["sandbox_id"], template=existing_template,
                     status="starting",
                 )
                 sandbox = await self._connect_to_existing_sandbox(
                     sandbox_meta["sandbox_id"], timeout=timeout,
+                    key_id=sandbox_meta.get("key_id"),
                 )
             except BaseException as exc:
                 if self._is_sandbox_not_found(exc):
@@ -362,42 +366,62 @@ class SandboxManagerMixin:
         if not create_if_missing:
             return None, {}, ""
 
-        api_key = self.config.get("e2b_api_key", "")
+        candidates = await self._key_pool.candidates()
         proxy = str(self.config.get("proxy", DEFAULT_PROXY) or "").strip()
         await self._capacity.acquire(session_id)
-        request_id = uuid.uuid4().hex
-        def mark_starting():
+        last_rejection = None
+        for key_id, api_key in candidates:
+            request_id = uuid.uuid4().hex
+
+            def mark_starting():
+                self._update_sandbox_session(
+                    session_id, "", template=requested_template, status="starting",
+                    request_id=request_id, key_id=key_id,
+                )
+
+            try:
+                sandbox = await self._create_sandbox(
+                    api_key=api_key, timeout=timeout, proxy=proxy, template=requested_template,
+                    metadata={"plugin": PLUGIN_NAME, "request_id": request_id},
+                    on_start=mark_starting,
+                )
+                sandbox_id = self._extract_sandbox_id(sandbox)
+                if not sandbox_id:
+                    raise RuntimeError("Sandbox created, but the SDK did not expose a sandbox ID.")
+            except BaseException as exc:
+                # Only a definitive account rejection can authorize another
+                # CREATE. Timeouts, cancellations and 5xx may have created a VM:
+                # keep the request_id + owner binding for later reconciliation.
+                status = self._api_error_status(exc)
+                if isinstance(exc, Exception) and self._key_pool.is_definitive_account_rejection(exc, status):
+                    self._key_pool.reject(key_id, status)
+                    last_rejection = exc
+                    continue
+                if session_id not in self.sandbox_sessions or self._is_activation_rejected(exc):
+                    self._delete_sandbox_session(session_id)
+                    await self._capacity.release(session_id)
+                else:
+                    self.sandbox_sessions[session_id]["status"] = "unknown"
+                    self._save_sandbox_sessions()
+                    await self._finish_pause(session_id)
+                raise
+
             self._update_sandbox_session(
-                session_id, "", template=requested_template, status="starting", request_id=request_id,
+                session_id, sandbox_id, template=requested_template,
+                status="running", key_id=key_id,
             )
-        try:
-            sandbox = await self._create_sandbox(
-                api_key=api_key, timeout=timeout, proxy=proxy, template=requested_template,
-                metadata={"plugin": PLUGIN_NAME, "request_id": request_id},
-                on_start=mark_starting,
+            return (
+                sandbox, self.sandbox_sessions[session_id],
+                f"Created sandbox {sandbox_id} for this session.",
             )
-            sandbox_id = self._extract_sandbox_id(sandbox)
-            if not sandbox_id:
-                raise RuntimeError("Sandbox created, but the SDK did not expose a sandbox ID.")
-        except BaseException as exc:
-            if session_id not in self.sandbox_sessions or self._is_activation_rejected(exc):
-                self._delete_sandbox_session(session_id)
-                await self._capacity.release(session_id)
-            else:
-                self.sandbox_sessions[session_id]["status"] = "unknown"
-                self._save_sandbox_sessions()
-                await self._finish_pause(session_id)
-            raise
 
-        self._update_sandbox_session(
-            session_id,
-            sandbox_id,
-            template=requested_template,
-            status="running",
-        )
-        return sandbox, self.sandbox_sessions[session_id], f"Created sandbox {sandbox_id} for this session."
+        # Every attempted account returned a definitive rejection. No VM
+        # was created, so releasing the reservation is safe.
+        self._delete_sandbox_session(session_id)
+        await self._capacity.release(session_id)
+        raise RuntimeError(f"All configured E2B API Keys rejected sandbox creation. Last error: {last_rejection}")
 
-    async def _connect_to_existing_sandbox(self, sandbox_id: str, timeout: int = DEFAULT_SANDBOX_TIMEOUT):
+    async def _connect_to_existing_sandbox(self, sandbox_id: str, timeout: int = DEFAULT_SANDBOX_TIMEOUT, key_id: str = None):
         if self._sandbox_sdk is None:
             raise RuntimeError("self._sandbox_sdk class not found.")
 
@@ -407,7 +431,7 @@ class SandboxManagerMixin:
                 "Current E2B SDK does not support reconnecting sandboxes. Upgrade the E2B SDK first."
             )
 
-        api_key = self.config.get("e2b_api_key", "")
+        api_key = self._key_pool.resolve(key_id)
         proxy = str(self.config.get("proxy", DEFAULT_PROXY) or "").strip()
         connect_kwargs = {
             "sandbox_id": sandbox_id,
