@@ -185,10 +185,14 @@ class MediaMixin:
                     with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp_file:
                         tmp_file.write(data)
                         tmp_path = tmp_file.name
-                    await evt.send(evt.chain_result([Image.fromFileSystem(tmp_path)]))
+                    await asyncio.wait_for(
+                        evt.send(evt.chain_result([Image.fromFileSystem(tmp_path)])), timeout=20,
+                    )
                     logger.info("[E2B] Async image sent successfully.")
+                    return True
                 except Exception as exc:
-                    logger.error(f"[E2B] Async image send failed: {exc}")
+                    logger.error(f"[E2B] Async image send failed: {type(exc).__name__}")
+                    return False
                 finally:
                     if tmp_path and os.path.exists(tmp_path):
                         try:
@@ -196,9 +200,13 @@ class MediaMixin:
                         except Exception:
                             pass
 
-            asyncio.create_task(send_image_task(img_bytes, img_ext, event))
-            has_sent_image = True
-            break
+            task = self._track_task(
+                asyncio.create_task(send_image_task(img_bytes, img_ext, event)),
+                self._inflight_tasks,
+            )
+            has_sent_image = await asyncio.shield(task)
+            if has_sent_image:
+                break
 
         return has_sent_image
 
@@ -415,10 +423,32 @@ class MediaMixin:
     def _get_pending_files(self, event: AstrMessageEvent):
         current_files = self._extract_event_files(event)
         session_id = self._get_session_id(event)
-        if current_files:
-            self.session_files[session_id] = current_files[-MAX_SESSION_FILE_COUNT:]
-            return list(self.session_files[session_id])
-        return list(self.session_files.get(session_id, []))
+        message_id = getattr(getattr(event, "message_obj", None), "message_id", None)
+        token = ("message", str(message_id)) if message_id is not None else ("event", event)
+        same_event = self._file_event_ids.get(session_id) == token
+        cached_files = self.session_files.get(session_id, [])
+        cached_by_identity = {}
+        cached_by_name = {}
+        for item in cached_files:
+            identity = item.get("file_id") or item.get("file") or item.get("url")
+            if identity:
+                cached_by_identity[(item.get("name"), str(identity))] = item
+            cached_by_name[item.get("name")] = item
+        merged = []
+        for item in current_files:
+            item = dict(item)
+            identity = item.get("file_id") or item.get("file") or item.get("url")
+            previous = cached_by_identity.get((item.get("name"), str(identity))) if identity else None
+            if previous is None and same_event and not identity:
+                previous = cached_by_name.get(item.get("name"))
+            if previous and not item.get("path"):
+                item["path"] = previous.get("path")
+            merged.append(item)
+        if not current_files and same_event:
+            merged = list(cached_files)
+        self.session_files[session_id] = merged[-MAX_SESSION_FILE_COUNT:]
+        self._file_event_ids[session_id] = token
+        return list(self.session_files[session_id])
 
     def _normalize_file_meta(self, file_meta):
         if not isinstance(file_meta, dict):

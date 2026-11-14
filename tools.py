@@ -17,8 +17,8 @@ def sandbox_action(method):
         except SandboxBusyError as exc:
             return f"Busy: {exc} Do not retry immediately in this turn."
         except Exception as exc:
-            logger.error(f"[E2B] {method.__name__} failed: {traceback.format_exc()}")
-            return f"Error: {exc}"
+            logger.error(f"[E2B] {method.__name__} failed: {self._key_pool.redact(traceback.format_exc())}")
+            return f"Error: {self._key_pool.redact(exc)}"
     return wrapped
 
 

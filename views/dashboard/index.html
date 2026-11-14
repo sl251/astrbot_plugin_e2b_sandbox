@@ -1,0 +1,114 @@
+<!doctype html>
+<!-- dev-expert · anti-slop: P4 H4 E4 S5 R5 V4 · Stat-Led Workbench -->
+<html lang="zh-CN" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'none'; font-src 'none'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>E2B 沙箱管理</title>
+  <link rel="stylesheet" href="./panel.css">
+  <!-- The host serves this SDK publicly; credentials stay in the parent WebUI.
+       Relative assets inherit the host's scoped view-asset path, never a CDN. -->
+  <script src="/api/plugin/page/bridge-sdk.js"></script>
+  <script src="./bridge-client.js" defer></script>
+  <script src="./panel.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#sessions-section">跳到会话列表</a>
+  <main class="workbench">
+    <header class="page-header">
+      <div>
+        <p class="eyebrow">E2B · 沙箱管理</p>
+        <h1>云端会话，一目了然</h1>
+        <p class="subtitle">查看资源占用，安全暂停或销毁已有沙箱。</p>
+      </div>
+      <div class="refresh-tools">
+        <button class="button button--primary" id="refresh-button" type="button" disabled>刷新快照</button>
+        <label class="toggle" for="auto-refresh">
+          <input id="auto-refresh" type="checkbox" checked>
+          每 10 秒刷新
+        </label>
+        <p id="poll-state" class="muted small">等待宿主桥接</p>
+      </div>
+    </header>
+
+    <div id="notice" class="notice" role="status" aria-live="polite">
+      正在连接 AstrBot WebUI。请从插件详情的页面入口打开，而非直接打开静态文件。
+    </div>
+    <noscript><p class="notice notice--error">此管理面板需要启用 JavaScript；关闭脚本时不会执行任何管理操作。</p></noscript>
+
+    <section class="summary-grid" aria-label="沙箱总览">
+      <article class="metric"><p>已有沙箱</p><strong id="count-total">—</strong><span>本地有效会话记录</span></article>
+      <article class="metric"><p><i class="dot dot--running" aria-hidden="true"></i>运行中</p><strong id="count-running">—</strong><span>持续占用运行容量</span></article>
+      <article class="metric"><p><i class="dot dot--paused" aria-hidden="true"></i>已暂停</p><strong id="count-paused">—</strong><span>保留云端变量与文件</span></article>
+      <article class="metric"><p><i class="dot dot--unknown" aria-hidden="true"></i>待确认</p><strong id="count-unknown">—</strong><span>含启动中或未知状态</span></article>
+    </section>
+
+    <div class="workspace-grid">
+      <section class="surface sessions-section" id="sessions-section" aria-labelledby="sessions-heading" tabindex="-1">
+        <div class="section-heading">
+          <div><h2 id="sessions-heading">会话列表</h2><p class="muted small" id="session-summary">等待快照</p></div>
+          <span class="chip" id="busy-count">忙碌 —</span>
+        </div>
+        <div class="filters">
+          <label class="field field--search" for="session-search"><span>查找会话或沙箱 ID</span><input id="session-search" type="search" placeholder="输入关键词" maxlength="240" autocomplete="off"></label>
+          <label class="field" for="status-filter"><span>状态</span><select id="status-filter"><option value="all">全部状态</option><option value="running">运行中</option><option value="paused">已暂停</option><option value="unknown">待确认</option><option value="busy">忙碌</option></select></label>
+        </div>
+        <div id="session-list" class="session-list" aria-busy="true"><p class="empty-state">正在等待认证后的本地快照…</p></div>
+        <nav class="pagination" aria-label="会话列表分页">
+          <button class="button button--quiet" id="previous-page" type="button" disabled>上一页</button>
+          <span class="small muted" id="page-label">—</span>
+          <button class="button button--quiet" id="next-page" type="button" disabled>下一页</button>
+        </nav>
+      </section>
+
+      <aside class="resource-column" aria-label="运行资源与账户状态">
+        <section class="surface" aria-labelledby="capacity-heading">
+          <h2 id="capacity-heading">运行容量</h2>
+          <p class="capacity-number"><strong id="capacity-used">—</strong><span>/ <span id="capacity-limit">—</span> 个</span></p>
+          <progress id="capacity-progress" value="0" max="1" aria-label="已占用运行容量"></progress>
+          <dl class="resource-list">
+            <div><dt>可用名额</dt><dd id="capacity-free">—</dd></div>
+            <div><dt>排队请求</dt><dd id="capacity-queue">—</dd></div>
+            <div><dt>排队等待上限</dt><dd id="capacity-timeout">—</dd></div>
+          </dl>
+          <p class="muted small">容量包含运行中与尚未确认停止的沙箱。面板操作不加入创建队列。</p>
+          <p id="capacity-pending" class="small warning-text" hidden>配置上限尚未应用到运行调度器；将按原有插件流程生效。</p>
+        </section>
+
+        <section class="surface" aria-labelledby="keys-heading">
+          <div class="section-heading"><h2 id="keys-heading">API Key 池</h2><span class="chip" id="key-count">—</span></div>
+          <div id="key-list" class="key-list"><p class="muted small">等待快照</p></div>
+          <p class="muted small">仅显示编号。冷却只影响新建轮询，已有沙箱必须使用原所属 Key。</p>
+        </section>
+
+        <section class="safety-note" aria-labelledby="safety-heading">
+          <h2 id="safety-heading">安全边界</h2>
+          <ul>
+            <li>此页不新建、不恢复、不执行代码。</li>
+            <li>无原所属 Key 的会话不可管理，不会自动换 Key。</li>
+            <li>忙碌或版本变化的目标会被拒绝。</li>
+            <li>销毁不可撤销，云端文件与变量会丢失。</li>
+          </ul>
+        </section>
+      </aside>
+    </div>
+
+    <footer class="snapshot-footer"><span>只读本地追踪，不主动探测云端；状态可能滞后。</span><span id="last-updated">尚未刷新</span></footer>
+  </main>
+
+  <dialog id="confirm-dialog" aria-labelledby="confirm-title" aria-describedby="confirm-description">
+    <div class="dialog-content">
+      <p class="eyebrow">再次确认 · 单个已有会话</p>
+      <h2 id="confirm-title">确认操作</h2>
+      <p id="confirm-description"></p>
+      <dl class="target-details"><dt>会话</dt><dd id="confirm-session"></dd><dt>目标沙箱 ID</dt><dd class="mono" id="confirm-sandbox"></dd><dt>原所属账户</dt><dd id="confirm-key"></dd></dl>
+      <label class="acknowledgment" id="pause-ack-label" for="pause-ack"><input id="pause-ack" type="checkbox">我确认暂停此沙箱，保留变量与文件。</label>
+      <label class="field" id="kill-input-label" for="kill-id" hidden><span>输入上方完整沙箱 ID 以确认销毁</span><input id="kill-id" type="text" autocomplete="off" spellcheck="false" maxlength="256"></label>
+      <p id="action-feedback" class="small" role="status" aria-live="polite"></p>
+      <div class="dialog-actions"><button id="cancel-action" class="button button--quiet" type="button">取消</button><button id="confirm-action" class="button button--primary" type="button" disabled>确认操作</button></div>
+    </div>
+  </dialog>
+</body>
+</html>

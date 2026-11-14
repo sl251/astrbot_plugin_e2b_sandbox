@@ -34,8 +34,9 @@ class SandboxManagerMixin:
         if self._maintenance_task:
             self._maintenance_task.cancel()
             await asyncio.gather(self._maintenance_task, return_exceptions=True)
-        if self._cleanup_tasks:
-            await asyncio.gather(*self._cleanup_tasks, return_exceptions=True)
+        pending_tasks = self._cleanup_tasks | self._inflight_tasks
+        if pending_tasks:
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
         # Keep durable records when cleanup fails, so reloads do not forget a running VM.
         for session_id in list(self.sandbox_sessions):
             lock = self._get_session_lock(session_id)
@@ -77,7 +78,7 @@ class SandboxManagerMixin:
             try:
                 await self._maintain_sessions()
             except Exception:
-                logger.warning(f"[E2B] Maintenance failed: {traceback.format_exc()}")
+                logger.warning(f"[E2B] Maintenance failed: {self._key_pool.redact(traceback.format_exc())}")
             await asyncio.sleep(5)
 
     async def _maintain_sessions(self):
@@ -163,7 +164,7 @@ class SandboxManagerMixin:
                 return True
             meta["status"] = "unknown"
             self._save_sandbox_sessions()
-            logger.warning(f"[E2B] Pause not confirmed for {session_id}; slot retained: {exc}")
+            logger.warning(f"[E2B] Pause not confirmed for {session_id}; slot retained: {self._key_pool.redact(exc)}")
             return False
 
     async def _finish_pause(self, session_id, sandbox=None):
@@ -286,12 +287,13 @@ class SandboxManagerMixin:
                 try:
                     await self._kill_sandbox_by_id(session_id)
                 except Exception as exc:
-                    logger.warning(f"[E2B] Expired sandbox cleanup unconfirmed for {session_id}: {exc}")
+                    logger.warning(f"[E2B] Expired sandbox cleanup unconfirmed for {session_id}: {self._key_pool.redact(exc)}")
                     continue
                 self.session_last_access.pop(session_id, None)
                 self.code_hashes.pop(session_id, None)
                 self.code_hash_timestamps.pop(session_id, None)
                 self.session_files.pop(session_id, None)
+                self._file_event_ids.pop(session_id, None)
                 self.generated_files.pop(session_id, None)
                 self.sent_file_signatures.pop(session_id, None)
                 logger.info(f"[E2B] Cleaned expired session cache: {session_id}")
@@ -368,11 +370,14 @@ class SandboxManagerMixin:
         if not create_if_missing:
             return None, {}, ""
 
-        candidates = await self._key_pool.candidates()
+        self._key_pool.ensure_any_available()
         proxy = str(self.config.get("proxy", DEFAULT_PROXY) or "").strip()
         await self._capacity.acquire(session_id)
         last_rejection = None
         try:
+            # A queued/cancelled request must not spend a rotation turn, and
+            # account availability may change while waiting for capacity.
+            candidates = await self._key_pool.candidates()
             for key_id, api_key in candidates:
                 request_id = uuid.uuid4().hex
                 request_started = False
@@ -431,7 +436,7 @@ class SandboxManagerMixin:
                 raise RuntimeError("All candidate E2B API Keys entered cooldown while waiting.")
             raise RuntimeError(
                 "All configured E2B API Keys rejected sandbox creation or entered cooldown. "
-                f"Last error: {last_rejection}"
+                f"Last error: {self._key_pool.redact(last_rejection)}"
             )
         finally:
             # Includes cancellation before sending, rejected attempts and Keys

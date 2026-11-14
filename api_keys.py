@@ -37,6 +37,14 @@ class ApiKeyPool:
         self._lock = asyncio.Lock()
         self._cooldown_until = {}
 
+    def ensure_any_available(self):
+        """Check admission without consuming the next account selection."""
+        if not self._order:
+            raise RuntimeError("E2B API Key is missing.")
+        now = time.monotonic()
+        if not any(self._cooldown_until.get(key_id, 0) <= now for key_id in self._order):
+            raise RuntimeError("All configured E2B API Keys are in cooldown.")
+
     @staticmethod
     def identifier(key):
         return "sha256:" + hashlib.sha256(key.encode("utf-8")).hexdigest()
@@ -70,11 +78,12 @@ class ApiKeyPool:
             raise RuntimeError("E2B API Key is missing.")
         async with self._lock:
             start = self._cursor % len(self._order)
-            self._cursor = (start + 1) % len(self._order)
             ordered = self._order[start:] + self._order[:start]
             now = time.monotonic()
             active = [key_id for key_id in ordered
                       if self._cooldown_until.get(key_id, 0) <= now]
+            if active:
+                self._cursor = (self._order.index(active[0]) + 1) % len(self._order)
         if not active:
             raise RuntimeError("All configured E2B API Keys are in cooldown.")
         return [(key_id, self._keys[key_id]) for key_id in active]
@@ -89,6 +98,13 @@ class ApiKeyPool:
         return status in (401, 402, 403, 429) or (
             type(exc).__name__ in ("AuthenticationException", "RateLimitException")
         )
+
+    def redact(self, value):
+        text = str(value)
+        for secret in self._keys.values():
+            if secret:
+                text = text.replace(secret, "[REDACTED]")
+        return text
 
     def reject(self, key_id, status):
         # Avoid hammering accounts with exhausted quotas or explicit rate limits.

@@ -149,6 +149,8 @@ class SessionStoreMixin:
             session_id
             for session_id, last_access in self.session_last_access.items()
             if last_access < cutoff and session_id not in self.sandbox_sessions
+            and not (self.session_locks.get(session_id) and self.session_locks[session_id].locked())
+            and not self._has_pending_cleanup(session_id)
         ]
 
         for session_id in expired_session_ids:
@@ -156,6 +158,7 @@ class SessionStoreMixin:
             self.code_hashes.pop(session_id, None)
             self.code_hash_timestamps.pop(session_id, None)
             self.session_files.pop(session_id, None)
+            self._file_event_ids.pop(session_id, None)
             self.generated_files.pop(session_id, None)
             self.sent_file_signatures.pop(session_id, None)
             self.session_locks.pop(session_id, None)

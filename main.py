@@ -36,6 +36,7 @@ from .constants import (
     PLUGIN_NAME as PLUGIN_NAME,
 )
 from .api_keys import ApiKeyPool
+from .web_panel import WebPanel
 from .tools import RunPythonCodeTool, CreateSandboxTool, ResumeSandboxTool, PauseSandboxTool, KillSandboxTool, SandboxStatusTool, ListFilesTool, SendFileTool, sandbox_action
 from .sandbox_manager import SandboxManagerMixin
 from .session_store import SessionStoreMixin
@@ -51,6 +52,7 @@ class Main(SandboxManagerMixin, SessionStoreMixin, ExecutorMixin, MediaMixin, st
         self.code_hashes = defaultdict(str)
         self.code_hash_timestamps = {}
         self.session_files = defaultdict(list)
+        self._file_event_ids = {}
         self.generated_files = defaultdict(list)
         self.sent_file_signatures = defaultdict(set)
         self.session_last_access = {}
@@ -69,10 +71,29 @@ class Main(SandboxManagerMixin, SessionStoreMixin, ExecutorMixin, MediaMixin, st
         self._next_creation_time = 0.0
         self._maintenance_task = None
         self._cleanup_tasks = set()
+        self._inflight_tasks = set()
         self._session_cleanup_tasks = {}
         self._last_expired_cleanup = None
         self._stopping = False
         self._register_llm_tools()
+        # Optional WebUI panel; register() fails closed on hosts without the
+        # authenticated plugin Web API, leaving plugin behaviour unchanged.
+        self._web_panel = WebPanel(self)
+
+    async def initialize(self):
+        await super().initialize()
+        self._web_panel.register()
+
+    async def terminate(self):
+        # Stop accepting panel requests before the sandbox manager drains
+        # operations, then let the manager pause/kill as usual.
+        await self._web_panel.close()
+        await super().terminate()
+
+    def _track_task(self, task, bucket):
+        bucket.add(task)
+        task.add_done_callback(bucket.discard)
+        return task
 
     @property
     def _sandbox_sdk(self):
@@ -121,10 +142,14 @@ class Main(SandboxManagerMixin, SessionStoreMixin, ExecutorMixin, MediaMixin, st
 
         session_id = self._get_session_id(event)
         self.session_files[session_id] = files[-MAX_SESSION_FILE_COUNT:]
+        message_id = getattr(getattr(event, "message_obj", None), "message_id", None)
+        self._file_event_ids[session_id] = (
+            ("message", str(message_id)) if message_id is not None else ("event", event)
+        )
         logger.info(
             f"[E2B] Cached {len(self.session_files[session_id])} file(s) for session {session_id}"
         )
-        logger.info(f"[E2B] Cached file metadata: {self.session_files[session_id]}")
+        logger.debug(f"[E2B] Cached file names: {[meta.get('name') for meta in self.session_files[session_id]]}")
 
     @sandbox_action
     async def create_session_sandbox(self, event: AstrMessageEvent, template: str = ""):

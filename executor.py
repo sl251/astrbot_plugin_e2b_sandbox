@@ -81,6 +81,7 @@ class ExecutorMixin:
         auto_pause = auto_pause is not False or self.config.get("allow_keep_running", False) is not True
 
         async with self._session_operation(session_id):
+            stage = "sandbox activation"
             try:
                 pending_files = self._get_pending_files(event)
                 hash_source = json.dumps(
@@ -102,12 +103,14 @@ class ExecutorMixin:
                 if sandbox_notice:
                     llm_feedback.append(f"[System Notification] {sandbox_notice}")
 
+                stage = "file upload"
                 uploaded_paths = await self._stage_pending_files(event, sandbox, pending_files)
                 if uploaded_paths:
                     llm_feedback.append(
                         "[System Notification] Uploaded files: " + ", ".join(uploaded_paths)
                     )
 
+                stage = "dependency preparation"
                 packages = self._detect_packages(code_to_run)
                 if packages:
                     await self._install_dependencies(sandbox, packages)
@@ -115,6 +118,7 @@ class ExecutorMixin:
                 before_snapshot = await self._snapshot_sandbox_files(sandbox)
                 full_code = self._build_execution_code(code_to_run)
 
+                stage = "code execution"
                 logger.info("[E2B] Running user code...")
                 execution = await asyncio.wait_for(
                     sandbox.run_code(
@@ -152,6 +156,7 @@ class ExecutorMixin:
                         f"EXECUTION ERROR:\n{self._stringify_output(execution_error)}"
                     )
 
+                stage = "result delivery"
                 has_sent_image = await self._handle_images(event, execution, streamed_results)
                 if has_sent_image:
                     llm_feedback.append(
@@ -216,10 +221,12 @@ class ExecutorMixin:
             except SandboxBusyError:
                 raise
             except asyncio.TimeoutError:
-                return f"Error: Execution timed out (>{exec_timeout}s)."
+                if stage == "code execution":
+                    return f"Error: Execution timed out (>{exec_timeout}s)."
+                return f"E2B {stage} timed out. Sandbox state will be reconciled before retry."
             except Exception as exc:
-                logger.error(f"[E2B] Execution Exception: {traceback.format_exc()}")
-                return f"Runtime Error: {exc}"
+                logger.error(f"[E2B] Execution Exception: {self._key_pool.redact(traceback.format_exc())}")
+                return f"Runtime Error: {self._key_pool.redact(exc)}"
             finally:
                 if sandbox is not None and not completed:
                     await self._finish_pause(session_id, sandbox)
