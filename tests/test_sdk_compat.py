@@ -70,6 +70,7 @@ class SDKCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         import httpx
         payload = bytes(range(256))
         fs._envd_api = types.SimpleNamespace(get=AsyncMock(return_value=httpx.Response(200, content=payload)))
+        fs._envd_api_download = fs._envd_api
         result = await self.plugin._read_sandbox_file_bytes(types.SimpleNamespace(files=fs), "/home/user/test.bin")
         self.assertEqual(result, payload)
         self.assertEqual(fs._envd_api.get.call_args.kwargs["timeout"], 30)
