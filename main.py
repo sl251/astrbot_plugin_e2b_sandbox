@@ -51,6 +51,7 @@ except ImportError:
     SandboxQuery = SandboxState = None
 
 from .constants import *
+from .api_keys import ApiKeyPool
 from .tools import RunPythonCodeTool, CreateSandboxTool, ResumeSandboxTool, PauseSandboxTool, KillSandboxTool, SandboxStatusTool, ListFilesTool, SendFileTool, sandbox_action
 from .sandbox_manager import SandboxManagerMixin
 from .session_store import SessionStoreMixin
@@ -62,6 +63,7 @@ class Main(SandboxManagerMixin, SessionStoreMixin, ExecutorMixin, MediaMixin, st
     def __init__(self, context: star.Context, config=None):
         super().__init__(context)
         self.config = config or {}
+        self._key_pool = ApiKeyPool(self.config)
         self.code_hashes = defaultdict(str)
         self.code_hash_timestamps = {}
         self.session_files = defaultdict(list)
