@@ -7,9 +7,8 @@ Integration (performed by the caller, not by this module):
     # Before the existing shutdown routine:
     await self._web_panel.close()
 
-The inspected host discovers ``views/<name>/index.html`` (``pages`` is an
-alias); it has no register_web_page(). Point ``views`` at the shipped ``webui``
-directory, or package a copy as views. This module never creates that link or
+The inspected host discovers the shipped ``views/dashboard/index.html``;
+``pages`` is an alias and there is no register_web_page(). This module never
 writes a local file. register_web_api() takes route/handler/methods/description,
 not an auth scope. The host authenticates extension calls and binds
 astrbot.api.web.request. We additionally require a signed, unexpired dashboard
@@ -39,6 +38,7 @@ from .constants import (
     DEFAULT_MAX_UPLOAD_FILE_SIZE_MB,
     DEFAULT_PAUSED_RETENTION_HOURS,
     DEFAULT_QUEUE_WAIT_TIMEOUT,
+    MAX_RETURN_FILE_SIZE_MB,
     PLUGIN_NAME,
 )
 from .runtime_capacity import SandboxBusyError
@@ -295,6 +295,11 @@ class WebPanel:
         bound = {identifier: 0 for identifier in order}
         sessions = []
         records = list(getattr(plugin, "sandbox_sessions", {}).items())
+        sandbox_counts = {}
+        for _, meta in records:
+            sandbox_id = meta.get("sandbox_id") if isinstance(meta, dict) else None
+            if isinstance(sandbox_id, str) and sandbox_id:
+                sandbox_counts[sandbox_id] = sandbox_counts.get(sandbox_id, 0) + 1
         for session_id, meta in records:
             if not isinstance(session_id, str) or not isinstance(meta, dict):
                 continue
@@ -306,11 +311,13 @@ class WebPanel:
             owner_known = self._owner_known(meta)
             identity_safe = (isinstance(sandbox_id, str) and bool(sandbox_id)
                              and len(sandbox_id) <= 256 and sandbox_id == public_id)
+            ambiguous = isinstance(sandbox_id, str) and sandbox_counts.get(sandbox_id, 0) > 1
             try:
                 version = self._version(session_id, meta)
             except (TypeError, ValueError):
                 version = ""
             allowed = bool(identity_safe and owner_known and version and not busy
+                           and not ambiguous
                            and not self._closed and not getattr(plugin, "_stopping", False))
             owner = meta.get("key_id")
             if isinstance(owner, str) and owner in bound:
@@ -319,6 +326,7 @@ class WebPanel:
             counts[state if state in ("running", "paused") else "unknown"] += 1
             counts["busy"] += int(busy)
             blocked = ("busy" if busy else "owner_missing" if not owner_known
+                       else "ambiguous_target" if ambiguous
                        else "identity_unconfirmed" if not identity_safe or not version
                        else "stopping" if not allowed else "")
             sessions.append({
@@ -376,7 +384,7 @@ class WebPanel:
                 "upload_limit_mb": _bounded_int(config.get("max_upload_file_size_mb"),
                                                 DEFAULT_MAX_UPLOAD_FILE_SIZE_MB, 1, 100),
                 "return_file_limit_mb": _bounded_int(config.get("max_return_file_size_mb"),
-                                                     DEFAULT_MAX_RETURN_FILE_SIZE_MB, 1, 100),
+                                                     DEFAULT_MAX_RETURN_FILE_SIZE_MB, 1, MAX_RETURN_FILE_SIZE_MB),
             },
             "plugin": {
                 "version": self._plugin_version(),

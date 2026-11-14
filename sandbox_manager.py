@@ -34,6 +34,10 @@ class SandboxManagerMixin:
         if self._maintenance_task:
             self._maintenance_task.cancel()
             await asyncio.gather(self._maintenance_task, return_exceptions=True)
+        # Await only the operation scope, not the host's entire message task.
+        # Otherwise reload can return while a locked execution still owns a VM.
+        if self._operation_completions:
+            await asyncio.gather(*tuple(self._operation_completions))
         pending_tasks = self._cleanup_tasks | self._inflight_tasks
         if pending_tasks:
             await asyncio.gather(*pending_tasks, return_exceptions=True)
@@ -60,7 +64,14 @@ class SandboxManagerMixin:
         if lock.locked() or self._has_pending_cleanup(session_id):
             raise SandboxBusyError("Another sandbox operation is active in this session.")
         async with lock:
-            yield
+            completion = asyncio.get_running_loop().create_future()
+            self._operation_completions.add(completion)
+            try:
+                yield
+            finally:
+                if not completion.done():
+                    completion.set_result(None)
+                self._operation_completions.discard(completion)
 
     def _has_pending_cleanup(self, session_id):
         task = self._session_cleanup_tasks.get(session_id)
@@ -250,6 +261,13 @@ class SandboxManagerMixin:
             await self._capacity.release(session_id)
         elif state == "running":
             meta["status"] = "running"
+            # An out-of-band resume starts a new pause/retention cycle.
+            meta.pop("paused_at", None)
+            self._capacity.occupied.add(session_id)
+        else:
+            # An unrecognised cloud state is not proof the VM is stopped.
+            meta["status"] = "unknown"
+            meta.pop("paused_at", None)
             self._capacity.occupied.add(session_id)
         self._save_sandbox_sessions()
 
@@ -336,8 +354,14 @@ class SandboxManagerMixin:
             try:
                 self._update_sandbox_session(
                     session_id, sandbox_meta["sandbox_id"], template=existing_template,
-                    status="starting", key_id=owner,
+                    status="starting", key_id=owner, require_persist=True,
                 )
+            except Exception:
+                # A local write failure cannot have resumed a paused VM.
+                if sandbox_meta.get("status") == "paused":
+                    await self._capacity.release(session_id)
+                raise
+            try:
                 sandbox = await self._connect_to_existing_sandbox(
                     sandbox_meta["sandbox_id"], timeout=timeout,
                     key_id=owner,
@@ -387,6 +411,7 @@ class SandboxManagerMixin:
                     self._update_sandbox_session(
                         session_id, "", template=requested_template, status="starting",
                         request_id=request_id, key_id=key_id,
+                        require_persist=True,
                     )
                     request_started = True
 

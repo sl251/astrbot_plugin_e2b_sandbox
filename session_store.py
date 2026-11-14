@@ -1,5 +1,7 @@
 import asyncio
 import json
+import math
+import os
 import re
 import time
 from pathlib import Path
@@ -29,7 +31,25 @@ class SessionStoreMixin:
         try:
             with open(self._sandbox_state_path, "r", encoding="utf-8") as file_obj:
                 loaded = json.load(file_obj)
-            self.sandbox_sessions = loaded if isinstance(loaded, dict) else {}
+            # Losing these records also loses account ownership and occupied
+            # slots. Never treat a corrupt file as a fresh installation.
+            if not isinstance(loaded, dict):
+                raise ValueError("Session state must be an object.")
+            for session_id, meta in loaded.items():
+                if not isinstance(session_id, str) or not isinstance(meta, dict):
+                    raise ValueError("Invalid session record.")
+                for name in ("sandbox_id", "key_id", "request_id", "template", "status"):
+                    if name in meta and not isinstance(meta[name], str):
+                        raise ValueError("Invalid session identity or status.")
+                if not (meta.get("sandbox_id") or meta.get("request_id")):
+                    raise ValueError("Session has no recoverable identity.")
+                for name in ("last_active", "paused_at", "created_at"):
+                    value = meta.get(name)
+                    if name in meta and (isinstance(value, bool)
+                            or not isinstance(value, (int, float))
+                            or not math.isfinite(value) or value < 0):
+                        raise ValueError("Invalid session timestamp.")
+            self.sandbox_sessions = loaded
             # Pre-1.4 session files have no owner identifier. The old single
             # e2b_api_key is the only known owner; preserve that binding.
             if self._key_pool.legacy_id:
@@ -39,20 +59,28 @@ class SessionStoreMixin:
                         meta["key_id"] = self._key_pool.legacy_id
                         changed = True
                 if changed:
-                    self._save_sandbox_sessions()
+                    if self._save_sandbox_sessions() is False:
+                        raise OSError("Session owner migration could not be saved.")
         except Exception as exc:
-            logger.warning(f"[E2B] Failed to load sandbox session state: {exc}")
-            self.sandbox_sessions = {}
+            logger.error(f"[E2B] Session state could not be loaded: {type(exc).__name__}")
+            raise RuntimeError(
+                "E2B session state could not be loaded safely. Preserve and repair "
+                "sandbox_sessions.json (or restore a backup), then reload the plugin."
+            ) from None
 
     def _save_sandbox_sessions(self):
-        self._plugin_data_dir.mkdir(parents=True, exist_ok=True)
         temp_path = self._sandbox_state_path.with_suffix(".tmp")
         try:
+            self._plugin_data_dir.mkdir(parents=True, exist_ok=True)
             with open(temp_path, "w", encoding="utf-8") as file_obj:
-                json.dump(self.sandbox_sessions, file_obj, ensure_ascii=False, indent=2)
+                json.dump(self.sandbox_sessions, file_obj, ensure_ascii=False, indent=2, allow_nan=False)
+                file_obj.flush()
+                os.fsync(file_obj.fileno())
             temp_path.replace(self._sandbox_state_path)
+            return True
         except Exception as exc:
-            logger.warning(f"[E2B] Failed to save sandbox session state: {exc}")
+            logger.warning(f"[E2B] Failed to save sandbox session state: {self._key_pool.redact(exc)}")
+            return False
 
     def _get_session_lock(self, session_id: str):
         lock = self.session_locks.get(session_id)
@@ -126,6 +154,7 @@ class SessionStoreMixin:
         status: str = "running",
         request_id: str = "",
         key_id: str = "",
+        require_persist: bool = False,
     ):
         previous = self.sandbox_sessions.get(session_id, {})
         self.sandbox_sessions[session_id] = {
@@ -135,12 +164,24 @@ class SessionStoreMixin:
             "last_active": time.time(),
             "request_id": request_id or previous.get("request_id", ""),
             "key_id": key_id or previous.get("key_id", "") or self._key_pool.legacy_id,
-            "created_at": previous.get("created_at") or time.time(),
+            # Legacy records did not store creation time; reconnecting is not
+            # creation. Keep it unknown instead of inventing a recent timestamp.
+            "created_at": previous.get("created_at", 0) if previous else time.time(),
         }
-        self._save_sandbox_sessions()
+        if self._save_sandbox_sessions() is False and require_persist:
+            # No activation has been sent yet. Restore memory as well as
+            # leaving the previous on-disk file intact.
+            if previous:
+                self.sandbox_sessions[session_id] = previous
+            else:
+                self.sandbox_sessions.pop(session_id, None)
+            raise RuntimeError("Cannot persist E2B activation intent; activation was not sent.")
 
     def _delete_sandbox_session(self, session_id: str):
         self.sandbox_sessions.pop(session_id, None)
+        # A replacement VM has none of the old VM's variables or side effects.
+        self.code_hashes.pop(session_id, None)
+        self.code_hash_timestamps.pop(session_id, None)
         self._save_sandbox_sessions()
 
     def _cleanup_session_cache(self):

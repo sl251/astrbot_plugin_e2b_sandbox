@@ -72,6 +72,7 @@ class Main(SandboxManagerMixin, SessionStoreMixin, ExecutorMixin, MediaMixin, st
         self._maintenance_task = None
         self._cleanup_tasks = set()
         self._inflight_tasks = set()
+        self._operation_completions = set()
         self._session_cleanup_tasks = {}
         self._last_expired_cleanup = None
         self._stopping = False
@@ -87,6 +88,7 @@ class Main(SandboxManagerMixin, SessionStoreMixin, ExecutorMixin, MediaMixin, st
     async def terminate(self):
         # Stop accepting panel requests before the sandbox manager drains
         # operations, then let the manager pause/kill as usual.
+        self._stopping = True
         await self._web_panel.close()
         await super().terminate()
 

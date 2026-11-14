@@ -98,7 +98,7 @@
   "max_return_file_size_mb": {
     "type": "int",
     "description": "回传文件上限（MB）",
-    "hint": "从沙箱下载并发送给用户的单个文件大小上限；过大的文件会跳过。",
+    "hint": "从沙箱下载并发送给用户的单个文件大小上限，范围 1–50 MB；过大的文件会跳过。",
     "default": 5
   },
   "paused_sandbox_retention_hours": {

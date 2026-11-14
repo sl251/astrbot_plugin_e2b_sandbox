@@ -97,8 +97,6 @@ class ExecutorMixin:
                     timeout=sandbox_lifespan,
                     create_if_missing=True,
                 )
-                self.code_hashes[session_id] = current_hash
-                self.code_hash_timestamps[session_id] = time.time()
                 self.generated_files[session_id] = []
                 if sandbox_notice:
                     llm_feedback.append(f"[System Notification] {sandbox_notice}")
@@ -119,6 +117,11 @@ class ExecutorMixin:
                 full_code = self._build_execution_code(code_to_run)
 
                 stage = "code execution"
+                # Upload/install failures have not executed user code and must
+                # allow an immediate corrected retry. Once sent, retain the
+                # fingerprint even on timeout: remote side effects are uncertain.
+                self.code_hashes[session_id] = current_hash
+                self.code_hash_timestamps[session_id] = time.time()
                 logger.info("[E2B] Running user code...")
                 execution = await asyncio.wait_for(
                     sandbox.run_code(
@@ -317,7 +320,7 @@ class ExecutorMixin:
     def _safe_int(self, value, default, minimum=None, maximum=None):
         try:
             parsed = int(value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             parsed = default
 
         if minimum is not None:

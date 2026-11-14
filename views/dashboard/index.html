@@ -189,7 +189,7 @@
                   <th scope="col" class="col-status">状态</th>
                   <th scope="col" class="col-key">Key / 模板</th>
                   <th scope="col" class="col-time">时间记录</th>
-                  <th scope="col" class="col-files" title="待传文件 / 已生成文件">文件</th>
+                  <th scope="col" class="col-files" title="缓存附件 / 已生成文件；缓存不代表仍待上传">文件</th>
                   <th scope="col" class="col-actions">操作</th>
                 </tr>
               </thead>
@@ -251,7 +251,7 @@
           <div id="key-list" class="key-list">
             <p class="muted small">等待快照…</p>
           </div>
-          <p class="panel-footnote">冷却仅影响新建轮询；已有沙箱严格绑定原所属 Key，禁止跨 Key 操作。</p>
+          <p class="panel-footnote">可轮询只代表本地未处于冷却，不代表认证或余额已验证。冷却仅影响新建；已有沙箱始终使用原所属 Key。</p>
         </section>
       </aside>
     </div>

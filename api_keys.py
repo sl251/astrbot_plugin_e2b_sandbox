@@ -14,7 +14,8 @@ class ApiKeyPool:
     """Select an account only on *creation*; existing sandboxes keep their owner."""
 
     def __init__(self, config):
-        legacy = str(config.get("e2b_api_key") or "").strip()
+        legacy = config.get("e2b_api_key")
+        legacy = legacy.strip() if isinstance(legacy, str) else ""
         raw = config.get("e2b_api_keys") or []
         if isinstance(raw, str):
             entries = re.split(r"[,\r\n]+", raw)
@@ -23,7 +24,7 @@ class ApiKeyPool:
         else:
             entries = []
         values = ([legacy] if legacy else []) + [
-            str(item).strip() for item in entries if str(item).strip()
+            item.strip() for item in entries if isinstance(item, str) and item.strip()
         ]
         self._keys = {}
         self._order = []
@@ -101,7 +102,8 @@ class ApiKeyPool:
 
     def redact(self, value):
         text = str(value)
-        for secret in self._keys.values():
+        # A shorter configured secret must not expose the suffix of a longer one.
+        for secret in sorted(self._keys.values(), key=len, reverse=True):
             if secret:
                 text = text.replace(secret, "[REDACTED]")
         return text

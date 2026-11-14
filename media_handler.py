@@ -26,6 +26,7 @@ from .constants import (
     DEFAULT_UPLOAD_DIR,
     DEFAULT_WORK_DIR,
     MAX_GENERATED_FILE_CANDIDATES,
+    MAX_RETURN_FILE_SIZE_MB,
     MAX_SESSION_FILE_COUNT,
     SANDBOX_PATH_PATTERN,
 )
@@ -524,7 +525,7 @@ class MediaMixin:
             self.config.get("max_return_file_size_mb"),
             DEFAULT_MAX_RETURN_FILE_SIZE_MB,
             minimum=1,
-            maximum=50,
+            maximum=MAX_RETURN_FILE_SIZE_MB,
         ) * 1024 * 1024
 
         candidates = []

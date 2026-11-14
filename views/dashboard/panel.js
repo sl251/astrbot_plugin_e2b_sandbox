@@ -593,7 +593,7 @@
     filesWrap.appendChild(element('span', '', displayNumber(session.pending_files)));
     filesWrap.appendChild(element('span', 'file-sep', '/'));
     filesWrap.appendChild(element('span', '', displayNumber(session.generated_files)));
-    filesWrap.setAttribute('title', '待传文件 / 已生成文件');
+    filesWrap.setAttribute('title', '缓存附件 / 已生成文件；缓存附件不代表仍待上传');
     tdFiles.appendChild(filesWrap);
     tr.appendChild(tdFiles);
 
@@ -640,7 +640,7 @@
     keyCountdowns.length = 0;
     const validKeys = snapshot.keys.filter((key) => key && typeof key === 'object');
     const availableCount = validKeys.filter((key) => key.available !== false && number(key.cooldown_seconds) <= 0).length;
-    text($('key-count'), validKeys.length ? `${availableCount}/${validKeys.length} 可用` : '0 个');
+    text($('key-count'), validKeys.length ? `${availableCount}/${validKeys.length} 可轮询` : '0 个');
 
     const fragment = document.createDocumentFragment();
     validKeys.forEach((key) => {
@@ -708,6 +708,11 @@
         const mm = Math.floor(remaining / 60);
         const ss = String(remaining % 60).padStart(2, '0');
         text(item.countdown, `剩余 ${mm}:${ss}`);
+      } else if (item.remaining > 0) {
+        item.badge.className = 'badge badge--unknown';
+        text(item.badge, '待刷新');
+        item.countdown.className = 'mono';
+        text(item.countdown, '冷却计时结束 · 请刷新确认');
       } else if (!item.availableFlag) {
         item.badge.className = 'badge badge--unknown';
         text(item.badge, '不可用');
@@ -715,9 +720,9 @@
         text(item.countdown, '暂不可分配');
       } else {
         item.badge.className = 'badge badge--running';
-        text(item.badge, '可用');
+        text(item.badge, '可轮询');
         item.countdown.className = 'mono key-ready';
-        text(item.countdown, item.remaining > 0 ? '冷却到期 · 待刷新' : '可新建轮询');
+        text(item.countdown, '可参与新建轮询');
       }
     });
 

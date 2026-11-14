@@ -1,6 +1,6 @@
 name: astrbot_plugin_e2b_sandbox
 author: sl251
-version: "1.4.0"
+version: "1.4.2"
 astrbot_version: ">=4.9.2"
 description: "E2B 云沙箱 Python 执行、会话持久化、多 API Key 轮询、容量排队与自动清理"
 repo: "https://github.com/sl251/astrbot_plugin_e2b_sandbox"
@@ -80,7 +80,7 @@ configs:
   max_return_file_size_mb:
     type: int
     default: 5
-    description: "允许下载并发送给用户的单个生成文件大小上限（MB）"
+    description: "允许下载并发送给用户的单个生成文件大小上限（1–50 MB）"
   file_retention_hours:
     type: int
     default: 24
