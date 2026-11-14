@@ -72,8 +72,7 @@ class ExecutorMixin:
         await self._cleanup_expired_sessions()
         self._mark_session_active(event)
 
-        api_key = self.config.get("e2b_api_key", "")
-        if not api_key:
+        if not self._key_pool.has_keys:
             return "Error: E2B API Key is missing."
         if self._sandbox_sdk is None:
             return "Error: self._sandbox_sdk class not found."
