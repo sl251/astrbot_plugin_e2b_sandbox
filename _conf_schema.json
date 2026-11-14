@@ -8,7 +8,7 @@
   "e2b_api_keys": {
     "type": "list",
     "description": "额外的 E2B API Key",
-    "hint": "每项一个 API Key。与旧 e2b_api_key 合并去重后按新建沙箱轮询；已有沙箱仍使用创建时的 Key。",
+    "hint": "每项一个 API Key。与旧 e2b_api_key 合并去重后按新建沙箱轮询；已有沙箱仍使用创建时的 Key。升级旧会话时先保留原 e2b_api_key 并重载，完成归属迁移后再移动到列表。",
     "default": []
   },
   "timeout": {

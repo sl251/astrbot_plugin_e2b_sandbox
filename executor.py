@@ -1,39 +1,24 @@
 import ast
 import asyncio
-import base64
 import hashlib
-import inspect
 import json
-import os
-import posixpath
 import re
-import shutil
-import tempfile
 import time
 import traceback
-import uuid
-import zipfile
-from collections import defaultdict
-from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
-from functools import wraps
-from io import BytesIO
-from pathlib import Path
-from typing import Any
 
-import astrbot.api.message_components as Comp
-from astrbot.api import FunctionTool, logger, star
-from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.message_components import Image
-from astrbot.api.provider import ProviderRequest
+from astrbot.api import logger
+from astrbot.api.event import AstrMessageEvent
 
-from .runtime_capacity import RuntimeCapacity, SandboxBusyError
-from .file_transfer import download_http, read_limited
+from .runtime_capacity import SandboxBusyError
 from .sandbox_bootstrap import FONT_SETUP_CODE
-from .execution_policy import apply_execution_policy
-from .constants import *
+from .constants import (
+    DEFAULT_EXEC_TIMEOUT,
+    DEFAULT_OUTPUT_LIMIT,
+    DEFAULT_SANDBOX_TIMEOUT,
+    IMPORT_PACKAGE_MAP,
+    MAX_RESULT_LIMIT,
+)
 from .tools import sandbox_action
-from .utils import shlex_quote
 
 class ExecutorMixin:
     @sandbox_action

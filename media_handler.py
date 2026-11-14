@@ -1,38 +1,34 @@
-import ast
 import asyncio
 import base64
 import hashlib
 import inspect
-import json
 import os
 import posixpath
 import re
 import shutil
 import tempfile
 import time
-import traceback
-import uuid
 import zipfile
-from collections import defaultdict
-from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
-from functools import wraps
 from io import BytesIO
 from pathlib import Path
-from typing import Any
 
 import astrbot.api.message_components as Comp
-from astrbot.api import FunctionTool, logger, star
-from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api import logger
+from astrbot.api.event import AstrMessageEvent
 from astrbot.api.message_components import Image
-from astrbot.api.provider import ProviderRequest
 
-from .runtime_capacity import RuntimeCapacity, SandboxBusyError
 from .file_transfer import download_http, read_limited
-from .sandbox_bootstrap import FONT_SETUP_CODE
-from .execution_policy import apply_execution_policy
-from .constants import *
-from .tools import sandbox_action
+from .constants import (
+    DEFAULT_EXPORT_DIRNAME,
+    DEFAULT_FILE_RETENTION_HOURS,
+    DEFAULT_MAX_RETURN_FILE_SIZE_MB,
+    DEFAULT_MAX_UPLOAD_FILE_SIZE_MB,
+    DEFAULT_UPLOAD_DIR,
+    DEFAULT_WORK_DIR,
+    MAX_GENERATED_FILE_CANDIDATES,
+    MAX_SESSION_FILE_COUNT,
+    SANDBOX_PATH_PATTERN,
+)
 from .utils import shlex_quote
 
 class MediaMixin:

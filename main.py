@@ -1,35 +1,15 @@
-import ast
 import asyncio
-import base64
-import hashlib
-import inspect
-import json
-import os
-import posixpath
-import re
-import shutil
-import tempfile
 import time
-import traceback
-import uuid
-import zipfile
 from collections import defaultdict
-from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
-from functools import wraps
-from io import BytesIO
 from pathlib import Path
-from typing import Any
 
-import astrbot.api.message_components as Comp
-from astrbot.api import FunctionTool, logger, star
+from astrbot.api import logger, star
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.message_components import Image
 from astrbot.api.provider import ProviderRequest
 
-from .runtime_capacity import RuntimeCapacity, SandboxBusyError
-from .file_transfer import download_http, read_limited
-from .sandbox_bootstrap import FONT_SETUP_CODE
+from .runtime_capacity import RuntimeCapacity
+# Retain the public exports used by existing integration helpers.
+from .sandbox_bootstrap import FONT_SETUP_CODE as FONT_SETUP_CODE
 from .execution_policy import apply_execution_policy
 
 try:
@@ -50,7 +30,11 @@ try:
 except ImportError:
     SandboxQuery = SandboxState = None
 
-from .constants import *
+from .constants import (
+    DEFAULT_SANDBOX_TIMEOUT,
+    MAX_SESSION_FILE_COUNT,
+    PLUGIN_NAME as PLUGIN_NAME,
+)
 from .api_keys import ApiKeyPool
 from .tools import RunPythonCodeTool, CreateSandboxTool, ResumeSandboxTool, PauseSandboxTool, KillSandboxTool, SandboxStatusTool, ListFilesTool, SendFileTool, sandbox_action
 from .sandbox_manager import SandboxManagerMixin

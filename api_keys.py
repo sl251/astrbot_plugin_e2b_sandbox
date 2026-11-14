@@ -6,6 +6,10 @@ import re
 import time
 
 
+class KeyInCooldownError(RuntimeError):
+    """A queued creation must skip this Key without issuing an RPC."""
+
+
 class ApiKeyPool:
     """Select an account only on *creation*; existing sandboxes keep their owner."""
 
@@ -53,8 +57,6 @@ class ApiKeyPool:
             return self._keys[key_id]
         if self.legacy_id:
             return self._keys[self.legacy_id]
-        if len(self._order) == 1:
-            return self._keys[self._order[0]]
         if not self._order:
             raise RuntimeError("E2B API Key is missing.")
         raise RuntimeError(
@@ -76,6 +78,11 @@ class ApiKeyPool:
         if not active:
             raise RuntimeError("All configured E2B API Keys are in cooldown.")
         return [(key_id, self._keys[key_id]) for key_id in active]
+
+    def ensure_available(self, key_id):
+        """Recheck immediately before CREATE, after capacity/lock/rate waits."""
+        if self._cooldown_until.get(key_id, 0) > time.monotonic():
+            raise KeyInCooldownError("This E2B API Key entered cooldown while waiting.")
 
     @staticmethod
     def is_definitive_account_rejection(exc, status):

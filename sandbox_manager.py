@@ -1,39 +1,29 @@
-import ast
 import asyncio
-import base64
-import hashlib
 import inspect
-import json
-import os
-import posixpath
 import re
-import shutil
-import tempfile
 import time
 import traceback
 import uuid
-import zipfile
-from collections import defaultdict
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
-from functools import wraps
-from io import BytesIO
-from pathlib import Path
-from typing import Any
 
-import astrbot.api.message_components as Comp
-from astrbot.api import FunctionTool, logger, star
-from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.message_components import Image
-from astrbot.api.provider import ProviderRequest
+from astrbot.api import logger
+from astrbot.api.event import AstrMessageEvent
 
-from .runtime_capacity import RuntimeCapacity, SandboxBusyError
-from .file_transfer import download_http, read_limited
-from .sandbox_bootstrap import FONT_SETUP_CODE
-from .execution_policy import apply_execution_policy
-from .constants import *
-from .tools import sandbox_action
-from .utils import shlex_quote
+from .runtime_capacity import SandboxBusyError
+from .api_keys import KeyInCooldownError
+from .constants import (
+    DEFAULT_IDLE_PAUSE_SECONDS,
+    DEFAULT_MAX_QUEUE_SIZE,
+    DEFAULT_MAX_RUNNING_SANDBOXES,
+    DEFAULT_PAUSED_RETENTION_HOURS,
+    DEFAULT_PROXY,
+    DEFAULT_QUEUE_WAIT_TIMEOUT,
+    DEFAULT_SANDBOX_TIMEOUT,
+    DEFAULT_SESSION_RETENTION_HOURS,
+    DEFAULT_TEMPLATE,
+    PLUGIN_NAME,
+    SANDBOX_API_TIMEOUT,
+)
 
 class SandboxManagerMixin:
     async def initialize(self):
@@ -334,20 +324,32 @@ class SandboxManagerMixin:
                     "Kill the current sandbox before switching templates."
                 )
 
+            # Local configuration failures cannot have resumed a remote VM.
+            # Validate before reserving capacity or discarding paused_at.
+            owner = sandbox_meta.get("key_id") or self._key_pool.legacy_id
+            self._key_pool.resolve(owner)
+            if getattr(self._sandbox_sdk, "connect", None) is None:
+                raise RuntimeError("Current E2B SDK does not support reconnecting sandboxes.")
             await self._capacity.acquire(session_id)
             try:
                 self._update_sandbox_session(
                     session_id, sandbox_meta["sandbox_id"], template=existing_template,
-                    status="starting",
+                    status="starting", key_id=owner,
                 )
                 sandbox = await self._connect_to_existing_sandbox(
                     sandbox_meta["sandbox_id"], timeout=timeout,
-                    key_id=sandbox_meta.get("key_id"),
+                    key_id=owner,
                 )
             except BaseException as exc:
                 if self._is_sandbox_not_found(exc):
                     self._delete_sandbox_session(session_id)
                     await self._capacity.release(session_id)
+                elif sandbox_meta.get("status") == "paused" and self._is_activation_rejected(exc):
+                    # An explicit rejection did not resume this paused VM.
+                    self.sandbox_sessions[session_id] = sandbox_meta
+                    self._save_sandbox_sessions()
+                    await self._capacity.release(session_id)
+                    raise
                 else:
                     self.sandbox_sessions[session_id]["status"] = "unknown"
                     self._save_sandbox_sessions()
@@ -370,56 +372,72 @@ class SandboxManagerMixin:
         proxy = str(self.config.get("proxy", DEFAULT_PROXY) or "").strip()
         await self._capacity.acquire(session_id)
         last_rejection = None
-        for key_id, api_key in candidates:
-            request_id = uuid.uuid4().hex
+        try:
+            for key_id, api_key in candidates:
+                request_id = uuid.uuid4().hex
+                request_started = False
 
-            def mark_starting():
-                self._update_sandbox_session(
-                    session_id, "", template=requested_template, status="starting",
-                    request_id=request_id, key_id=key_id,
-                )
+                def mark_starting():
+                    nonlocal request_started
+                    self._update_sandbox_session(
+                        session_id, "", template=requested_template, status="starting",
+                        request_id=request_id, key_id=key_id,
+                    )
+                    request_started = True
 
-            try:
-                sandbox = await self._create_sandbox(
-                    api_key=api_key, timeout=timeout, proxy=proxy, template=requested_template,
-                    metadata={"plugin": PLUGIN_NAME, "request_id": request_id},
-                    on_start=mark_starting,
-                )
-                sandbox_id = self._extract_sandbox_id(sandbox)
-                if not sandbox_id:
-                    raise RuntimeError("Sandbox created, but the SDK did not expose a sandbox ID.")
-            except BaseException as exc:
-                # Only a definitive account rejection can authorize another
-                # CREATE. Timeouts, cancellations and 5xx may have created a VM:
-                # keep the request_id + owner binding for later reconciliation.
-                status = self._api_error_status(exc)
-                if isinstance(exc, Exception) and self._key_pool.is_definitive_account_rejection(exc, status):
-                    self._key_pool.reject(key_id, status)
-                    last_rejection = exc
+                try:
+                    sandbox = await self._create_sandbox(
+                        api_key=api_key, timeout=timeout, proxy=proxy, template=requested_template,
+                        metadata={"plugin": PLUGIN_NAME, "request_id": request_id},
+                        on_start=mark_starting,
+                    )
+                    sandbox_id = self._extract_sandbox_id(sandbox)
+                    if not sandbox_id:
+                        raise RuntimeError("Sandbox created, but the SDK did not expose a sandbox ID.")
+                except KeyInCooldownError:
+                    # Rechecked under the creation lock; no RPC or record exists.
                     continue
-                if session_id not in self.sandbox_sessions or self._is_activation_rejected(exc):
-                    self._delete_sandbox_session(session_id)
-                    await self._capacity.release(session_id)
-                else:
-                    self.sandbox_sessions[session_id]["status"] = "unknown"
-                    self._save_sandbox_sessions()
-                    await self._finish_pause(session_id)
-                raise
+                except BaseException as exc:
+                    status = self._api_error_status(exc)
+                    account_rejected = (
+                        isinstance(exc, Exception)
+                        and self._key_pool.is_definitive_account_rejection(exc, status)
+                    )
+                    if not request_started or account_rejected or self._is_activation_rejected(exc):
+                        # Discard a definitively rejected attempt BEFORE waiting
+                        # for the next Key. Cancellation there must not recover it.
+                        self._delete_sandbox_session(session_id)
+                        if request_started and account_rejected:
+                            last_rejection = exc
+                            continue
+                    else:
+                        # A sent request with a lost response may have created a
+                        # VM. Keep its owner/request_id and never switch accounts.
+                        self.sandbox_sessions[session_id]["status"] = "unknown"
+                        self._save_sandbox_sessions()
+                        await self._finish_pause(session_id)
+                    raise
 
-            self._update_sandbox_session(
-                session_id, sandbox_id, template=requested_template,
-                status="running", key_id=key_id,
-            )
-            return (
-                sandbox, self.sandbox_sessions[session_id],
-                f"Created sandbox {sandbox_id} for this session.",
-            )
+                self._update_sandbox_session(
+                    session_id, sandbox_id, template=requested_template,
+                    status="running", key_id=key_id,
+                )
+                return (
+                    sandbox, self.sandbox_sessions[session_id],
+                    f"Created sandbox {sandbox_id} for this session.",
+                )
 
-        # Every attempted account returned a definitive rejection. No VM
-        # was created, so releasing the reservation is safe.
-        self._delete_sandbox_session(session_id)
-        await self._capacity.release(session_id)
-        raise RuntimeError(f"All configured E2B API Keys rejected sandbox creation. Last error: {last_rejection}")
+            if last_rejection is None:
+                raise RuntimeError("All candidate E2B API Keys entered cooldown while waiting.")
+            raise RuntimeError(
+                "All configured E2B API Keys rejected sandbox creation or entered cooldown. "
+                f"Last error: {last_rejection}"
+            )
+        finally:
+            # Includes cancellation before sending, rejected attempts and Keys
+            # skipped after queueing. Only possible/existing VMs retain capacity.
+            if session_id not in self.sandbox_sessions:
+                await self._capacity.release(session_id)
 
     async def _connect_to_existing_sandbox(self, sandbox_id: str, timeout: int = DEFAULT_SANDBOX_TIMEOUT, key_id: str = None):
         if self._sandbox_sdk is None:
@@ -446,7 +464,9 @@ class SandboxManagerMixin:
             action_name="connect",
         )
 
-    async def _call_sandbox_entrypoint(self, method, kwargs, call_timeout: int, action_name: str):
+    async def _call_sandbox_entrypoint(
+        self, method, kwargs, call_timeout: int, action_name: str, on_start=None,
+    ):
         filtered_kwargs = {k: v for k, v in kwargs.items() if v is not None}
         try:
             signature = inspect.signature(method)
@@ -462,9 +482,17 @@ class SandboxManagerMixin:
         except (TypeError, ValueError):
             pass
 
+        activation_rejected = False
+
         async def invoke():
+            nonlocal activation_rejected
             deadline = time.monotonic() + call_timeout
             for attempt in range(3):
+                if attempt == 0 and on_start:
+                    # Persist at the actual invocation boundary, not before
+                    # scheduling this coroutine with wait_for().
+                    on_start()
+                activation_rejected = False
                 try:
                     result = method(**filtered_kwargs)
                     return await result if inspect.isawaitable(result) else result
@@ -475,6 +503,7 @@ class SandboxManagerMixin:
                     )
                     if not rate_limited or attempt == 2:
                         raise
+                    activation_rejected = True
                     response = getattr(exc, "response", None)
                     headers = getattr(exc, "headers", None) or getattr(response, "headers", {})
                     try:
@@ -491,7 +520,14 @@ class SandboxManagerMixin:
                         raise
             raise RuntimeError(f"E2B SDK {action_name} retry limit reached.")
 
-        return await asyncio.wait_for(invoke(), timeout=call_timeout)
+        try:
+            return await asyncio.wait_for(invoke(), timeout=call_timeout)
+        except (asyncio.CancelledError, asyncio.TimeoutError) as exc:
+            # wait_for can replace the CancelledError raised during retry sleep
+            # with TimeoutError. Preserve the fact that no RPC is in flight.
+            if activation_rejected:
+                exc.activation_rejected = True
+            raise
 
     async def _pause_sandbox(self, sandbox):
         for method_name in ("pause", "beta_pause"):
@@ -543,13 +579,22 @@ class SandboxManagerMixin:
 
         # Limit initial creates to Hobby's 1/sec, including failed attempts.
         async with self._creation_lock:
+            key_id = self._key_pool.identifier(api_key)
+            self._key_pool.ensure_available(key_id)
             delay = self._next_creation_time - time.monotonic()
             if delay > 0:
                 await asyncio.sleep(delay)
+            self._key_pool.ensure_available(key_id)
             self._next_creation_time = time.monotonic() + 1.05
-            if on_start:
-                on_start()
             # Do not fallback after a timeout/5xx: the first RPC may have created a VM.
-            return await self._call_sandbox_entrypoint(
-                method, create_kwargs, call_timeout=SANDBOX_API_TIMEOUT, action_name=action_name,
-            )
+            try:
+                return await self._call_sandbox_entrypoint(
+                    method, create_kwargs, call_timeout=SANDBOX_API_TIMEOUT, action_name=action_name,
+                    on_start=on_start,
+                )
+            except Exception as exc:
+                status = self._api_error_status(exc)
+                if self._key_pool.is_definitive_account_rejection(exc, status):
+                    # Publish cooldown before unlocking, so queued creates see it.
+                    self._key_pool.reject(key_id, status)
+                raise
