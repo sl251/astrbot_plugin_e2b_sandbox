@@ -13,7 +13,7 @@ class ApiKeyPool:
         legacy = str(config.get("e2b_api_key") or "").strip()
         raw = config.get("e2b_api_keys") or []
         if isinstance(raw, str):
-            entries = re.split(r"[,\\r\\n]+", raw)
+            entries = re.split(r"[,\r\n]+", raw)
         elif isinstance(raw, (list, tuple)):
             entries = raw
         else:
