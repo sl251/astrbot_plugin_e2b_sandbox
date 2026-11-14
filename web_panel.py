@@ -29,10 +29,15 @@ import re
 import secrets
 import time
 from importlib import import_module
+from pathlib import Path
 
 from .constants import (
+    DEFAULT_IDLE_PAUSE_SECONDS,
     DEFAULT_MAX_QUEUE_SIZE,
+    DEFAULT_MAX_RETURN_FILE_SIZE_MB,
     DEFAULT_MAX_RUNNING_SANDBOXES,
+    DEFAULT_MAX_UPLOAD_FILE_SIZE_MB,
+    DEFAULT_PAUSED_RETENTION_HOURS,
     DEFAULT_QUEUE_WAIT_TIMEOUT,
     PLUGIN_NAME,
 )
@@ -88,7 +93,9 @@ class WebPanel:
         self._web = None
         self._jwt = None
         self._salt = secrets.token_bytes(32)
+        self._started_at = time.time()
         self._closed = False
+        self._plugin_version_cache = None
         self._tasks = {}
         # Retain the exact handler objects: unregister must not remove a newly
         # reloaded instance's routes or any other plugin's API.
@@ -267,6 +274,17 @@ class WebPanel:
                     or (callable(pending) and pending(session_id))
                     or session_id in self._tasks)
 
+    def _plugin_version(self):
+        if self._plugin_version_cache is not None:
+            return self._plugin_version_cache
+        try:
+            text = Path(__file__).with_name("metadata.yaml").read_text(encoding="utf-8")
+            match = re.search(r'^version:\s*["\']?([^"\'\n]+)', text, re.MULTILINE)
+            self._plugin_version_cache = match.group(1).strip() if match else ""
+        except Exception:
+            self._plugin_version_cache = ""
+        return self._plugin_version_cache
+
     def snapshot(self):
         """Whitelisted DTO, not vars(plugin), configuration, or SDK metadata."""
         plugin = self.plugin
@@ -315,6 +333,10 @@ class WebPanel:
                 "owner_known": owner_known,
                 "last_active": max(0.0, _number(meta.get("last_active"))),
                 "paused_at": max(0.0, _number(meta.get("paused_at"))),
+                "created_at": max(0.0, _number(meta.get("created_at"))),
+                "template": self._public_text(meta.get("template"), 120),
+                "pending_files": _bounded_int(len(getattr(plugin, "session_files", {}).get(session_id) or ()), 0, 0, 1000),
+                "generated_files": _bounded_int(len(getattr(plugin, "generated_files", {}).get(session_id) or ()), 0, 0, 1000),
                 "can_pause": allowed and state != "paused",
                 "can_kill": allowed,
                 "blocked_reason": blocked,
@@ -326,6 +348,7 @@ class WebPanel:
             "label": labels[identifier],
             "cooldown_seconds": math.ceil(max(0.0, _number(cooldowns.get(identifier)) - now)),
             "bound_sessions": bound[identifier],
+            "available": math.ceil(max(0.0, _number(cooldowns.get(identifier)) - now)) <= 0,
         } for identifier in order]
         capacity = getattr(plugin, "_capacity", None)
         config = getattr(plugin, "config", None) or {}
@@ -346,6 +369,18 @@ class WebPanel:
                 "wait_timeout_seconds": _bounded_int(config.get("queue_wait_timeout"),
                                                      DEFAULT_QUEUE_WAIT_TIMEOUT, 1, 120),
                 "runtime_limit": _bounded_int(getattr(capacity, "limit", limit), limit, 1, 20),
+                "idle_pause_seconds": _bounded_int(config.get("idle_pause_seconds"),
+                                                   DEFAULT_IDLE_PAUSE_SECONDS, 5, 3600),
+                "paused_retention_hours": _bounded_int(config.get("paused_sandbox_retention_hours"),
+                                                       DEFAULT_PAUSED_RETENTION_HOURS, 1, 720),
+                "upload_limit_mb": _bounded_int(config.get("max_upload_file_size_mb"),
+                                                DEFAULT_MAX_UPLOAD_FILE_SIZE_MB, 1, 100),
+                "return_file_limit_mb": _bounded_int(config.get("max_return_file_size_mb"),
+                                                     DEFAULT_MAX_RETURN_FILE_SIZE_MB, 1, 100),
+            },
+            "plugin": {
+                "version": self._plugin_version(),
+                "uptime_seconds": max(0, int(time.time() - self._started_at)),
             },
             "keys": keys,
             "sessions": sessions,

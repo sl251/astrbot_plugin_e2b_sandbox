@@ -1,113 +1,306 @@
 <!doctype html>
-<!-- dev-expert · anti-slop: P4 H4 E4 S5 R5 V4 · Stat-Led Workbench -->
-<html lang="zh-CN" data-theme="light">
+<html lang="zh-CN" data-theme="dark">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="referrer" content="no-referrer">
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'none'; font-src 'none'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
-  <title>E2B 沙箱管理</title>
+  <title>E2B 沙箱管理台</title>
   <link rel="stylesheet" href="./panel.css">
-  <!-- The host serves this SDK publicly; credentials stay in the parent WebUI.
-       Relative assets inherit the host's scoped view-asset path, never a CDN. -->
   <script src="/api/plugin/page/bridge-sdk.js"></script>
   <script src="./bridge-client.js" defer></script>
   <script src="./panel.js" defer></script>
 </head>
 <body>
   <a class="skip-link" href="#sessions-section">跳到会话列表</a>
-  <main class="workbench">
-    <header class="page-header">
-      <div>
-        <p class="eyebrow">E2B · 沙箱管理</p>
-        <h1>云端会话，一目了然</h1>
-        <p class="subtitle">查看资源占用，安全暂停或销毁已有沙箱。</p>
+
+  <main class="console">
+    <header class="topbar fade-in fade-in--1">
+      <div class="brand-block">
+        <div class="brand-title-row">
+          <span class="brand-mark" aria-hidden="true">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 2L3 7v10l9 5 9-5V7l-9-5z"/>
+              <path d="M3 7l9 5 9-5"/>
+              <path d="M12 22V12"/>
+            </svg>
+          </span>
+          <h1>E2B Sandbox</h1>
+          <span class="version-pill mono" id="plugin-version">v—</span>
+        </div>
+        <div class="brand-meta">
+          <span class="meta-item">
+            <span class="meta-label">运行时长</span>
+            <span class="meta-value mono" id="plugin-uptime">—</span>
+          </span>
+          <span class="meta-sep" aria-hidden="true">/</span>
+          <span class="meta-item">
+            <span class="meta-label">最后刷新</span>
+            <span class="meta-value mono" id="last-updated">—</span>
+          </span>
+        </div>
       </div>
-      <div class="refresh-tools">
-        <button class="button button--primary" id="refresh-button" type="button" disabled>刷新快照</button>
-        <label class="toggle" for="auto-refresh">
+
+      <div class="topbar-actions">
+        <span class="poll-pill" id="poll-pill">
+          <span class="poll-dot" aria-hidden="true"></span>
+          <span id="poll-state">等待宿主桥接</span>
+        </span>
+
+        <label class="switch" for="auto-refresh">
           <input id="auto-refresh" type="checkbox" checked>
-          每 10 秒刷新
+          <span class="switch-track" aria-hidden="true"><span class="switch-thumb"></span></span>
+          <span class="switch-label">10s 自动刷新</span>
         </label>
-        <p id="poll-state" class="muted small">等待宿主桥接</p>
+
+        <button class="btn btn--icon" id="theme-toggle" type="button" aria-label="切换明暗主题" title="切换明暗主题">
+          <svg class="icon-sun" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="4"/>
+            <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/>
+          </svg>
+          <svg class="icon-moon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+          </svg>
+        </button>
+
+        <button class="btn btn--primary" id="refresh-button" type="button" disabled>
+          <svg class="refresh-icon" id="refresh-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M21 12a9 9 0 1 1-2.64-6.36"/>
+            <path d="M21 3v6h-6"/>
+          </svg>
+          <span id="refresh-label">刷新快照</span>
+        </button>
       </div>
     </header>
 
-    <div id="notice" class="notice" role="status" aria-live="polite">
-      正在连接 AstrBot WebUI。请从插件详情的页面入口打开，而非直接打开静态文件。
+    <div id="notice-bar" class="notice" role="status" aria-live="polite">
+      <div class="notice-main">
+        <span class="notice-dot" aria-hidden="true"></span>
+        <p id="notice" class="notice-text">正在连接 AstrBot WebUI。请从插件详情的页面入口打开，而非直接打开静态文件。</p>
+      </div>
+      <button id="retry-button" class="btn btn--ghost btn--sm" type="button" hidden>立即重试</button>
     </div>
-    <noscript><p class="notice notice--error">此管理面板需要启用 JavaScript；关闭脚本时不会执行任何管理操作。</p></noscript>
 
-    <section class="summary-grid" aria-label="沙箱总览">
-      <article class="metric"><p>已有沙箱</p><strong id="count-total">—</strong><span>本地有效会话记录</span></article>
-      <article class="metric"><p><i class="dot dot--running" aria-hidden="true"></i>运行中</p><strong id="count-running">—</strong><span>持续占用运行容量</span></article>
-      <article class="metric"><p><i class="dot dot--paused" aria-hidden="true"></i>已暂停</p><strong id="count-paused">—</strong><span>保留云端变量与文件</span></article>
-      <article class="metric"><p><i class="dot dot--unknown" aria-hidden="true"></i>待确认</p><strong id="count-unknown">—</strong><span>含启动中或未知状态</span></article>
+    <noscript>
+      <p class="notice notice--error">此管理台需要启用 JavaScript；禁用脚本时不会读取快照或执行任何操作。</p>
+    </noscript>
+
+    <section class="kpi-strip fade-in fade-in--2" aria-label="沙箱核心指标">
+      <article class="kpi-card">
+        <div class="kpi-head">
+          <span class="kpi-label"><i class="dot dot--running" aria-hidden="true"></i>运行中</span>
+          <span class="kpi-tag">RUNNING</span>
+        </div>
+        <strong class="kpi-value mono" id="count-running">—</strong>
+        <p class="kpi-sub" id="running-sub">占用运行槽位</p>
+      </article>
+
+      <article class="kpi-card">
+        <div class="kpi-head">
+          <span class="kpi-label"><i class="dot dot--paused" aria-hidden="true"></i>已暂停</span>
+          <span class="kpi-tag">PAUSED</span>
+        </div>
+        <strong class="kpi-value mono" id="count-paused">—</strong>
+        <p class="kpi-sub">保留环境与文件</p>
+      </article>
+
+      <article class="kpi-card">
+        <div class="kpi-head">
+          <span class="kpi-label"><i class="dot dot--unknown" aria-hidden="true"></i>待确认</span>
+          <span class="kpi-tag">UNKNOWN</span>
+        </div>
+        <strong class="kpi-value mono" id="count-unknown">—</strong>
+        <p class="kpi-sub">启动中或状态未知</p>
+      </article>
+
+      <article class="kpi-card">
+        <div class="kpi-head">
+          <span class="kpi-label"><i class="dot dot--neutral" aria-hidden="true"></i>队列等待</span>
+          <span class="kpi-tag">QUEUE</span>
+        </div>
+        <strong class="kpi-value mono" id="capacity-waiting">—</strong>
+        <p class="kpi-sub">等待空闲槽位</p>
+      </article>
+
+      <article class="kpi-card kpi-card--capacity">
+        <div class="kpi-head">
+          <span class="kpi-label">容量占用</span>
+          <span class="kpi-percent mono" id="capacity-percent">—</span>
+        </div>
+        <div class="kpi-capacity-value">
+          <strong class="kpi-value mono" id="capacity-used">—</strong>
+          <span class="kpi-denom mono">/ <span id="capacity-limit">—</span></span>
+        </div>
+        <progress id="capacity-progress" class="capacity-bar" value="0" max="1" aria-label="已占用运行容量"></progress>
+        <p class="kpi-sub mono" id="capacity-brief">可用 — · 排队 —</p>
+      </article>
     </section>
 
-    <div class="workspace-grid">
-      <section class="surface sessions-section" id="sessions-section" aria-labelledby="sessions-heading" tabindex="-1">
-        <div class="section-heading">
-          <div><h2 id="sessions-heading">会话列表</h2><p class="muted small" id="session-summary">等待快照</p></div>
-          <span class="chip" id="busy-count">忙碌 —</span>
+    <div class="workspace fade-in fade-in--3">
+      <section class="panel sessions-panel" id="sessions-section" aria-labelledby="sessions-heading" tabindex="-1">
+        <div class="panel-header">
+          <div class="panel-title-group">
+            <h2 id="sessions-heading">沙箱会话</h2>
+            <span class="chip mono" id="session-summary">共 — 条</span>
+          </div>
+          <span class="chip mono" id="count-total-chip">总记录 <span id="count-total">—</span></span>
         </div>
-        <div class="filters">
-          <label class="field field--search" for="session-search"><span>查找会话或沙箱 ID</span><input id="session-search" type="search" placeholder="输入关键词" maxlength="240" autocomplete="off"></label>
-          <label class="field" for="status-filter"><span>状态</span><select id="status-filter"><option value="all">全部状态</option><option value="running">运行中</option><option value="paused">已暂停</option><option value="unknown">待确认</option><option value="busy">忙碌</option></select></label>
+
+        <div class="toolbar">
+          <label class="search-field" for="session-search">
+            <svg class="search-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="11" cy="11" r="8"/>
+              <path d="M21 21l-4.35-4.35"/>
+            </svg>
+            <input id="session-search" type="search" placeholder="搜索会话标识或沙箱 ID…" maxlength="240" autocomplete="off" aria-label="搜索会话标识或沙箱 ID">
+          </label>
+
+          <div class="toolbar-selects">
+            <select id="status-filter" class="select" aria-label="按状态筛选">
+              <option value="all">全部状态</option>
+              <option value="running">运行中</option>
+              <option value="paused">已暂停</option>
+              <option value="starting">启动中</option>
+              <option value="unknown">待确认</option>
+              <option value="busy">忙碌中</option>
+            </select>
+
+            <select id="session-sort" class="select" aria-label="排序方式">
+              <option value="last_active_desc">最近活动（新→旧）</option>
+              <option value="last_active_asc">最近活动（旧→新）</option>
+              <option value="created_at_desc">创建时间（新→旧）</option>
+              <option value="created_at_asc">创建时间（旧→新）</option>
+            </select>
+
+            <select id="page-size" class="select" aria-label="每页条数">
+              <option value="10">10 条/页</option>
+              <option value="20" selected>20 条/页</option>
+              <option value="50">50 条/页</option>
+            </select>
+          </div>
         </div>
-        <div id="session-list" class="session-list" aria-busy="true"><p class="empty-state">正在等待认证后的本地快照…</p></div>
+
+        <div id="sessions-region" class="sessions-region" aria-busy="true">
+          <div class="table-wrap" id="table-wrap">
+            <table class="session-table">
+              <thead>
+                <tr>
+                  <th scope="col" class="col-identity">会话 / 沙箱 ID</th>
+                  <th scope="col" class="col-status">状态</th>
+                  <th scope="col" class="col-key">Key / 模板</th>
+                  <th scope="col" class="col-time">时间记录</th>
+                  <th scope="col" class="col-files" title="待传文件 / 已生成文件">文件</th>
+                  <th scope="col" class="col-actions">操作</th>
+                </tr>
+              </thead>
+              <tbody id="session-list"></tbody>
+            </table>
+          </div>
+
+          <div id="session-empty" class="empty-state">
+            <div class="empty-graphic" aria-hidden="true">
+              <svg width="48" height="48" viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="8" y="10" width="32" height="28" rx="4"/>
+                <path d="M8 18h32"/>
+                <circle cx="14" cy="14" r="1.2" fill="currentColor" stroke="none"/>
+                <circle cx="19" cy="14" r="1.2" fill="currentColor" stroke="none"/>
+                <path d="M17 26l4 3-4 3"/>
+                <path d="M24 32h7"/>
+              </svg>
+            </div>
+            <h3 id="empty-title">还没有面板数据</h3>
+            <p id="empty-desc">宿主连接成功后会显示本地追踪的会话。</p>
+            <button id="reset-filters" class="btn btn--ghost btn--sm" type="button" hidden>重置筛选条件</button>
+          </div>
+        </div>
+
         <nav class="pagination" aria-label="会话列表分页">
-          <button class="button button--quiet" id="previous-page" type="button" disabled>上一页</button>
-          <span class="small muted" id="page-label">—</span>
-          <button class="button button--quiet" id="next-page" type="button" disabled>下一页</button>
+          <span class="page-summary mono" id="page-summary">—</span>
+          <div class="page-controls">
+            <button class="btn btn--ghost btn--sm" id="previous-page" type="button" disabled>上一页</button>
+            <span class="page-label mono" id="page-label">1 / 1</span>
+            <button class="btn btn--ghost btn--sm" id="next-page" type="button" disabled>下一页</button>
+          </div>
         </nav>
       </section>
 
-      <aside class="resource-column" aria-label="运行资源与账户状态">
-        <section class="surface" aria-labelledby="capacity-heading">
-          <h2 id="capacity-heading">运行容量</h2>
-          <p class="capacity-number"><strong id="capacity-used">—</strong><span>/ <span id="capacity-limit">—</span> 个</span></p>
-          <progress id="capacity-progress" value="0" max="1" aria-label="已占用运行容量"></progress>
-          <dl class="resource-list">
-            <div><dt>可用名额</dt><dd id="capacity-free">—</dd></div>
-            <div><dt>排队请求</dt><dd id="capacity-queue">—</dd></div>
-            <div><dt>排队等待上限</dt><dd id="capacity-timeout">—</dd></div>
+      <aside class="sidebar" aria-label="容量策略与 API Key 状态">
+        <section class="panel" aria-labelledby="capacity-heading">
+          <div class="panel-header">
+            <h2 id="capacity-heading">容量与策略</h2>
+            <span id="capacity-pending" class="badge badge--paused" hidden>调度上限待同步</span>
+          </div>
+          <dl class="policy-list">
+            <div class="policy-row"><dt>运行上限</dt><dd class="mono" id="capacity-limit-detail">—</dd></div>
+            <div class="policy-row"><dt>已用槽位</dt><dd class="mono" id="capacity-occupied-detail">—</dd></div>
+            <div class="policy-row"><dt>可用名额</dt><dd class="mono" id="capacity-free">—</dd></div>
+            <div class="policy-row"><dt>排队 / 队列上限</dt><dd class="mono" id="capacity-queue">—</dd></div>
+            <div class="policy-row"><dt>排队等待超时</dt><dd class="mono" id="capacity-timeout">—</dd></div>
+            <div class="policy-row"><dt>空闲自动暂停</dt><dd class="mono" id="policy-idle-pause">—</dd></div>
+            <div class="policy-row"><dt>暂停保留时长</dt><dd class="mono" id="policy-paused-retention">—</dd></div>
+            <div class="policy-row"><dt>上传大小上限</dt><dd class="mono" id="policy-upload-limit">—</dd></div>
+            <div class="policy-row"><dt>回传大小上限</dt><dd class="mono" id="policy-return-limit">—</dd></div>
           </dl>
-          <p class="muted small">容量包含运行中与尚未确认停止的沙箱。面板操作不加入创建队列。</p>
-          <p id="capacity-pending" class="small warning-text" hidden>配置上限尚未应用到运行调度器；将按原有插件流程生效。</p>
         </section>
 
-        <section class="surface" aria-labelledby="keys-heading">
-          <div class="section-heading"><h2 id="keys-heading">API Key 池</h2><span class="chip" id="key-count">—</span></div>
-          <div id="key-list" class="key-list"><p class="muted small">等待快照</p></div>
-          <p class="muted small">仅显示编号。冷却只影响新建轮询，已有沙箱必须使用原所属 Key。</p>
-        </section>
-
-        <section class="safety-note" aria-labelledby="safety-heading">
-          <h2 id="safety-heading">安全边界</h2>
-          <ul>
-            <li>此页不新建、不恢复、不执行代码。</li>
-            <li>无原所属 Key 的会话不可管理，不会自动换 Key。</li>
-            <li>忙碌或版本变化的目标会被拒绝。</li>
-            <li>销毁不可撤销，云端文件与变量会丢失。</li>
-          </ul>
+        <section class="panel" aria-labelledby="keys-heading">
+          <div class="panel-header">
+            <h2 id="keys-heading">API Key 池</h2>
+            <span class="chip mono" id="key-count">—</span>
+          </div>
+          <div id="key-list" class="key-list">
+            <p class="muted small">等待快照…</p>
+          </div>
+          <p class="panel-footnote">冷却仅影响新建轮询；已有沙箱严格绑定原所属 Key，禁止跨 Key 操作。</p>
         </section>
       </aside>
     </div>
 
-    <footer class="snapshot-footer"><span>只读本地追踪，不主动探测云端；状态可能滞后。</span><span id="last-updated">尚未刷新</span></footer>
+    <footer class="footer">
+      <div class="footer-item">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <ellipse cx="12" cy="5" rx="9" ry="3"/>
+          <path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/>
+          <path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/>
+        </svg>
+        <span>仅本地记录，不触发云端请求或主动探测，状态可能存在短暂滞后。</span>
+      </div>
+      <div class="footer-item">
+        <span>策略：空闲自动暂停 · 超期清理暂停沙箱 · 暂停与销毁均需二次确认</span>
+      </div>
+    </footer>
   </main>
 
   <dialog id="confirm-dialog" aria-labelledby="confirm-title" aria-describedby="confirm-description">
-    <div class="dialog-content">
-      <p class="eyebrow">再次确认 · 单个已有会话</p>
-      <h2 id="confirm-title">确认操作</h2>
-      <p id="confirm-description"></p>
-      <dl class="target-details"><dt>会话</dt><dd id="confirm-session"></dd><dt>目标沙箱 ID</dt><dd class="mono" id="confirm-sandbox"></dd><dt>原所属账户</dt><dd id="confirm-key"></dd></dl>
-      <label class="acknowledgment" id="pause-ack-label" for="pause-ack"><input id="pause-ack" type="checkbox">我确认暂停此沙箱，保留变量与文件。</label>
-      <label class="field" id="kill-input-label" for="kill-id" hidden><span>输入上方完整沙箱 ID 以确认销毁</span><input id="kill-id" type="text" autocomplete="off" spellcheck="false" maxlength="256"></label>
-      <p id="action-feedback" class="small" role="status" aria-live="polite"></p>
-      <div class="dialog-actions"><button id="cancel-action" class="button button--quiet" type="button">取消</button><button id="confirm-action" class="button button--primary" type="button" disabled>确认操作</button></div>
+    <div class="dialog-body">
+      <div class="dialog-header">
+        <span class="dialog-eyebrow">管理操作二次确认</span>
+        <h2 id="confirm-title">确认操作</h2>
+      </div>
+      <p id="confirm-description" class="dialog-desc"></p>
+
+      <dl class="dialog-target">
+        <div><dt>会话标识</dt><dd id="confirm-session"></dd></div>
+        <div><dt>目标沙箱 ID</dt><dd class="mono" id="confirm-sandbox"></dd></div>
+        <div><dt>原所属 Key</dt><dd id="confirm-key"></dd></div>
+      </dl>
+
+      <label class="dialog-check" id="pause-ack-label" for="pause-ack">
+        <input id="pause-ack" type="checkbox">
+        <span>我已确认暂停此沙箱，并保留其云端变量与文件。</span>
+      </label>
+
+      <label class="dialog-field" id="kill-input-label" for="kill-id" hidden>
+        <span>输入上方完整沙箱 ID 以确认永久销毁</span>
+        <input id="kill-id" type="text" autocomplete="off" spellcheck="false" maxlength="256" placeholder="粘贴或输入沙箱 ID">
+      </label>
+
+      <p id="action-feedback" class="dialog-feedback" role="status" aria-live="polite"></p>
+
+      <div class="dialog-actions">
+        <button id="cancel-action" class="btn btn--ghost" type="button">取消 (Esc)</button>
+        <button id="confirm-action" class="btn btn--primary" type="button" disabled>确认操作</button>
+      </div>
     </div>
   </dialog>
 </body>

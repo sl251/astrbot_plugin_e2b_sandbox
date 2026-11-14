@@ -135,6 +135,7 @@ class SessionStoreMixin:
             "last_active": time.time(),
             "request_id": request_id or previous.get("request_id", ""),
             "key_id": key_id or previous.get("key_id", "") or self._key_pool.legacy_id,
+            "created_at": previous.get("created_at") or time.time(),
         }
         self._save_sandbox_sessions()
 

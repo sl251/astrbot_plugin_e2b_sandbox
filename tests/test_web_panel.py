@@ -820,10 +820,13 @@ vm.runInNewContext(code, {
   assert.equal(elements.get('capacity-used').textContent, '—');
   assert.equal(elements.get('capacity-queue').textContent, '0 / —');
   assert.equal(elements.get('capacity-timeout').textContent, '—');
-  assert.equal(elements.get('last-updated').textContent, '最近更新：—');
-  const card = elements.get('session-list').children[0];
-  const blockedNode = card.children[3].children[0];
-  assert.equal(blockedNode.textContent, '操作前会再次校验完整 ID 与版本。');
+  assert.equal(elements.get('last-updated').textContent, '—');
+  const row = elements.get('session-list').children[0];
+  assert.equal(row.children.length, 6);
+  const actionBox = row.children[5].children[0];
+  // Unknown blocked_reason values must not be echoed as UI text.
+  assert.equal(actionBox.children.length, 1);
+  assert.equal(actionBox.children[0].className, 'action-row');
 
   // pagehide cleans up timers, context listener, and bridge client.
   for (const fn of (winListeners.get('pagehide') || [])) fn();

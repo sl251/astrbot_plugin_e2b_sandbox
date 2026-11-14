@@ -1,15 +1,15 @@
 {
-  "e2b_api_key": {
-    "type": "string",
-    "description": "E2B API Key",
-    "hint": "从 E2B 控制台获取，用于连接云端沙箱。",
-    "default": ""
-  },
   "e2b_api_keys": {
     "type": "list",
-    "description": "额外的 E2B API Key",
-    "hint": "每项一个 API Key。与旧 e2b_api_key 合并去重后按新建沙箱轮询；已有沙箱仍使用创建时的 Key。升级旧会话时先保留原 e2b_api_key 并重载，完成归属迁移后再移动到列表。",
+    "description": "E2B API Keys（多账户轮询）",
+    "hint": "推荐在这里填。每行一个 Key，只填一把也可以。新沙箱按顺序轮询使用；已有沙箱始终沿用创建时的那把 Key，调换顺序不会串号。",
     "default": []
+  },
+  "e2b_api_key": {
+    "type": "string",
+    "description": "旧版单 Key（升级迁移用）",
+    "hint": "仅用于识别旧版本创建的沙箱归属。曾用单 Key 创建过沙箱的，升级后先保留原值并重载，完成归属迁移后再把 Key 移到上面的列表并清空这里；新配置留空即可。",
+    "default": ""
   },
   "timeout": {
     "type": "int",
