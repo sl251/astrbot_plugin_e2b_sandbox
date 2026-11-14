@@ -7,6 +7,21 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 
+# Agg renders headlessly but its normal show() emits no notebook image. E2B
+# supplies display(); publish every open figure there and close after delivery.
+if callable(globals().get('display')):
+    def _e2b_show_figures(*args, **kwargs):
+        import base64
+        import io
+        for number in list(plt.get_fignums()):
+            with io.BytesIO() as image:
+                plt.figure(number).savefig(image, format='png', bbox_inches='tight')
+                # E2B may serialize a Figure as chart-only data; publishing a
+                # raw PNG MIME bundle guarantees a deliverable image result.
+                display({'image/png': base64.b64encode(image.getvalue()).decode('ascii')}, raw=True)
+        plt.close('all')
+    plt.show = _e2b_show_figures
+
 def _e2b_configure_font():
     import os
     import sys
