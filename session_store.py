@@ -51,6 +51,16 @@ class SessionStoreMixin:
             with open(self._sandbox_state_path, "r", encoding="utf-8") as file_obj:
                 loaded = json.load(file_obj)
             self.sandbox_sessions = loaded if isinstance(loaded, dict) else {}
+            # Pre-1.4 session files have no owner identifier. The old single
+            # e2b_api_key is the only known owner; preserve that binding.
+            if self._key_pool.legacy_id:
+                changed = False
+                for meta in self.sandbox_sessions.values():
+                    if isinstance(meta, dict) and not meta.get("key_id"):
+                        meta["key_id"] = self._key_pool.legacy_id
+                        changed = True
+                if changed:
+                    self._save_sandbox_sessions()
         except Exception as exc:
             logger.warning(f"[E2B] Failed to load sandbox session state: {exc}")
             self.sandbox_sessions = {}
@@ -136,6 +146,7 @@ class SessionStoreMixin:
         template: str = "",
         status: str = "running",
         request_id: str = "",
+        key_id: str = "",
     ):
         previous = self.sandbox_sessions.get(session_id, {})
         self.sandbox_sessions[session_id] = {
@@ -144,6 +155,7 @@ class SessionStoreMixin:
             "status": status,
             "last_active": time.time(),
             "request_id": request_id or previous.get("request_id", ""),
+            "key_id": key_id or previous.get("key_id", "") or self._key_pool.legacy_id,
         }
         self._save_sandbox_sessions()
 
