@@ -1,4 +1,4 @@
-"""Request-scoped execution guidance; the actual tools still enforce permissions."""
+"""单次请求级执行路由策略与工具可见性裁剪；底层工具自身的权限校验始终保留。"""
 
 from copy import copy
 
@@ -50,7 +50,7 @@ def _has_active_tool(tool_set, name):
 
 
 def _local_execution_restricted(context, event, logger):
-    # Never substitute global defaults for a missing conversation identity.
+    # 缺少会话来源标识时绝不回退使用全局默认配置
     origin = getattr(event, "unified_msg_origin", None)
     if not origin or not callable(getattr(context, "get_config", None)):
         return False
@@ -62,19 +62,19 @@ def _local_execution_restricted(context, event, logger):
             and not event.is_admin()
         )
     except Exception as exc:
-        # Older/third-party hosts retain their own tool permission checks.
+        # 旧版或第三方宿主仍保留其原生工具执行权限检查
         logger.warning(f"[E2B] Cannot determine host execution policy: {type(exc).__name__}")
         return False
 
 
 def apply_execution_policy(context, event, request, config, logger):
-    """Apply to this request only and report whether direct E2B execution exists."""
+    """仅对当前请求副本应用本机工具隐藏与云端默认路由引导，返回直接执行工具是否可用。"""
     tool_set = getattr(request, "func_tool", None)
     if _local_execution_restricted(context, event, logger):
         if config.get("hide_restricted_local_tools", True) is not False:
             if any(_has_active_tool(tool_set, name) for name in LOCAL_EXECUTION_TOOLS):
                 try:
-                    # Copy the container and its list, not plugin instances/locks.
+                    # 仅浅拷贝工具集合容器与列表，绝不深拷贝插件实例或内部异步锁
                     filtered = copy(tool_set)
                     filtered.tools = list(tool_set.tools)
                     for name in LOCAL_EXECUTION_TOOLS:

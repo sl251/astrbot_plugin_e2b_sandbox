@@ -2,7 +2,7 @@
   "e2b_api_keys": {
     "type": "list",
     "description": "E2B API Keys（多账户轮询）",
-    "hint": "推荐在这里填。每行一个 Key，只填一把也可以。新沙箱按顺序轮询使用；已有沙箱始终沿用创建时的那把 Key，调换顺序不会串号。",
+    "hint": "推荐在这里填。每行一个 Key（支持 `e2b_xxx # 主力号` 语法为面板添加备注名），只填一把也可以。新沙箱按顺序轮询；已有沙箱始终沿用创建时的那把 Key。",
     "default": []
   },
   "e2b_api_key": {
@@ -26,7 +26,7 @@
   "proxy": {
     "type": "string",
     "description": "代理地址",
-    "hint": "留空表示直连；代理地址示例：http://127.0.0.1:10809。",
+    "hint": "留空表示直连；国内服务器请填写代理地址，示例：http://127.0.0.1:10809。",
     "default": ""
   },
   "default_template": {
@@ -34,6 +34,14 @@
     "description": "默认模板 ID",
     "hint": "留空使用 E2B 默认环境；填写后从指定模板创建沙箱。",
     "default": ""
+  },
+  "sandbox_scope": {
+    "type": "string",
+    "description": "群聊沙箱隔离粒度",
+    "hint": "session 表示同一群聊全员共用一台协作沙箱；group_member 表示群聊中每位成员分配独立沙箱（互不干扰、不串文件，但各自计算配额）。私聊不受影响。",
+    "options": ["session", "group_member"],
+    "labels": ["按会话共享（群聊共用）", "群聊按成员独立隔离"],
+    "default": "session"
   },
   "prefer_e2b_for_code": {
     "type": "bool",
@@ -92,7 +100,7 @@
   "max_upload_file_size_mb": {
     "type": "int",
     "description": "上传文件上限（MB）",
-    "hint": "单个附件上传到沙箱前的大小上限，范围 1–100 MB；同时限制 HTTP(S) 下载和本地附件读取，超限会终止本次执行。",
+    "hint": "单个附件上传到沙箱前的大小上限，范围 1–100 MB；同时限制公网 HTTP(S) 下载和本地附件读取，超限会终止本次执行。",
     "default": 20
   },
   "max_return_file_size_mb": {

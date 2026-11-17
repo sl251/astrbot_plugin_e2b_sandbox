@@ -1,3 +1,5 @@
+"""AstrBot E2B 云沙箱插件主入口：工具注册、消息附件记忆、系统提示词注入与生命周期路由。"""
+
 import asyncio
 import time
 from collections import defaultdict
@@ -7,10 +9,32 @@ from astrbot.api import logger, star
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import ProviderRequest
 
-from .runtime_capacity import RuntimeCapacity
-# Retain the public exports used by existing integration helpers.
-from .sandbox_bootstrap import FONT_SETUP_CODE as FONT_SETUP_CODE
+from .api_keys import ApiKeyPool
+from .constants import (
+    DEFAULT_SANDBOX_TIMEOUT,
+    MAX_SESSION_FILE_COUNT,
+    PLUGIN_NAME as PLUGIN_NAME,
+)
 from .execution_policy import apply_execution_policy
+from .executor import ExecutorMixin
+from .media_handler import MediaMixin
+from .runtime_capacity import RuntimeCapacity
+# 保留现有集成辅助与单测依赖的公开符号导出
+from .sandbox_bootstrap import FONT_SETUP_CODE as FONT_SETUP_CODE
+from .sandbox_manager import SandboxManagerMixin
+from .session_store import SessionStoreMixin
+from .tools import (
+    CreateSandboxTool,
+    KillSandboxTool,
+    ListFilesTool,
+    PauseSandboxTool,
+    ResumeSandboxTool,
+    RunPythonCodeTool,
+    SandboxStatusTool,
+    SendFileTool,
+    sandbox_action,
+)
+from .web_panel import WebPanel
 
 try:
     from astrbot.core.utils.astrbot_path import get_astrbot_data_path
@@ -30,19 +54,6 @@ try:
 except ImportError:
     SandboxQuery = SandboxState = None
 
-from .constants import (
-    DEFAULT_SANDBOX_TIMEOUT,
-    MAX_SESSION_FILE_COUNT,
-    PLUGIN_NAME as PLUGIN_NAME,
-)
-from .api_keys import ApiKeyPool
-from .web_panel import WebPanel
-from .tools import RunPythonCodeTool, CreateSandboxTool, ResumeSandboxTool, PauseSandboxTool, KillSandboxTool, SandboxStatusTool, ListFilesTool, SendFileTool, sandbox_action
-from .sandbox_manager import SandboxManagerMixin
-from .session_store import SessionStoreMixin
-from .executor import ExecutorMixin
-from .media_handler import MediaMixin
-
 
 class Main(SandboxManagerMixin, SessionStoreMixin, ExecutorMixin, MediaMixin, star.Star):
     def __init__(self, context: star.Context, config=None):
@@ -52,6 +63,8 @@ class Main(SandboxManagerMixin, SessionStoreMixin, ExecutorMixin, MediaMixin, st
         self.code_hashes = defaultdict(str)
         self.code_hash_timestamps = {}
         self.session_files = defaultdict(list)
+        self.uploaded_session_files = defaultdict(list)
+        self._verified_sandbox_packages = {}
         self._file_event_ids = {}
         self.generated_files = defaultdict(list)
         self.sent_file_signatures = defaultdict(set)
@@ -77,8 +90,7 @@ class Main(SandboxManagerMixin, SessionStoreMixin, ExecutorMixin, MediaMixin, st
         self._last_expired_cleanup = None
         self._stopping = False
         self._register_llm_tools()
-        # Optional WebUI panel; register() fails closed on hosts without the
-        # authenticated plugin Web API, leaving plugin behaviour unchanged.
+        # 可选 WebUI 管理面板：旧版宿主缺少鉴权插件页面 API 时自动安全降级，不影响聊天功能
         self._web_panel = WebPanel(self)
 
     async def initialize(self):
@@ -86,8 +98,7 @@ class Main(SandboxManagerMixin, SessionStoreMixin, ExecutorMixin, MediaMixin, st
         self._web_panel.register()
 
     async def terminate(self):
-        # Stop accepting panel requests before the sandbox manager drains
-        # operations, then let the manager pause/kill as usual.
+        # 先停止接收面板新请求，再等待沙箱管理器排空进行中的锁内操作并收尾暂停
         self._stopping = True
         await self._web_panel.close()
         await super().terminate()
@@ -141,13 +152,20 @@ class Main(SandboxManagerMixin, SessionStoreMixin, ExecutorMixin, MediaMixin, st
             return
 
         files = await self._hydrate_component_files(event, files)
+        now = time.time()
+        for item in files:
+            item["awaiting_upload"] = True
+            item["cached_at"] = now
 
         session_id = self._get_session_id(event)
-        self.session_files[session_id] = files[-MAX_SESSION_FILE_COUNT:]
-        message_id = getattr(getattr(event, "message_obj", None), "message_id", None)
-        self._file_event_ids[session_id] = (
-            ("message", str(message_id)) if message_id is not None else ("event", event)
-        )
+        # 保留此前消息尚未上传且未同名冲突的待传附件，支持连续发送多份文档后再发文字提问
+        existing_pending = [
+            prev for prev in self.session_files.get(session_id, ())
+            if prev.get("awaiting_upload") is True
+            and prev.get("name") not in {f.get("name") for f in files}
+        ]
+        self.session_files[session_id] = (existing_pending + files)[-MAX_SESSION_FILE_COUNT:]
+        self._file_event_ids[session_id] = self._event_token(event)
         logger.info(
             f"[E2B] Cached {len(self.session_files[session_id])} file(s) for session {session_id}"
         )
@@ -277,7 +295,7 @@ class Main(SandboxManagerMixin, SessionStoreMixin, ExecutorMixin, MediaMixin, st
         )
 
     async def e2b_list_files(self, event: AstrMessageEvent, query: str = ""):
-        """List generated files cached from the latest E2B execution in this session."""
+        """列出当前会话最近一次云沙箱执行缓存的待发送结果文件。"""
         denied_message = self._get_user_access_denied_message(event)
         if denied_message:
             return denied_message
@@ -301,7 +319,7 @@ class Main(SandboxManagerMixin, SessionStoreMixin, ExecutorMixin, MediaMixin, st
         file_index: int = 0,
         name: str = "",
     ):
-        """Send one cached generated file to the user by name or 1-based index."""
+        """按文件名或从 1 开始的序号向当前聊天发送一份已缓存的生成文件。"""
         denied_message = self._get_user_access_denied_message(event)
         if denied_message:
             return denied_message
@@ -363,24 +381,21 @@ class Main(SandboxManagerMixin, SessionStoreMixin, ExecutorMixin, MediaMixin, st
             return
 
         if not apply_execution_policy(self.context, event, req, self.config, logger):
-            # E.g. disabled by the persona or delegated exclusively to a sub-agent.
-            # Do not advertise direct calls or cached file access that this agent lacks.
+            # 工具已被当前人格禁用或交由子代理单独持有时，不注入直接调用说明
             return
 
         req.system_prompt += (
             "\n\n[System Notice] The E2B sandbox is session-scoped. Reuse the current session sandbox when follow-up work depends on files or variables created earlier. "
-            "Create a sandbox with e2b_sandbox_create when you need one, run code with e2b_sandbox_run_python_code, and explicitly manage lifecycle with "
-            "e2b_sandbox_status, e2b_sandbox_pause, e2b_sandbox_resume, and e2b_sandbox_kill. "
-            "Code executions auto-pause unless the operator enables allow_keep_running and you pass auto_pause=false. Idle sandboxes still auto-pause. "
+            "Run code directly with e2b_sandbox_run_python_code (it automatically creates or reuses the sandbox; call e2b_sandbox_create only to pre-warm an empty sandbox), "
+            "and manage lifecycle with e2b_sandbox_status, e2b_sandbox_pause, e2b_sandbox_resume, and e2b_sandbox_kill when explicitly needed. "
+            "Code executions auto-pause unless allow_keep_running is enabled and you pass auto_pause=false. Idle sandboxes still auto-pause. "
             "Do not change template mid-session without killing the old sandbox first. Do not use top-level return in Python scripts. "
-            "Do not use send_message_to_user to send sandbox file paths such as /home/user/... . "
-            "When code generates files, this plugin caches candidate files and you should call e2b_sandbox_list_files and e2b_sandbox_send_file to deliver the right one to the user."
+            "Do not pass /home/user/... sandbox paths to send_message_to_user. "
+            "When code generates files, call e2b_sandbox_list_files and e2b_sandbox_send_file to deliver the chosen file."
         )
 
+        session_id = self._get_session_id(event)
         pending_files = self._get_pending_files(event)
-        if not pending_files:
-            return
-
         file_list = []
         for file_meta in pending_files:
             try:
@@ -389,15 +404,32 @@ class Main(SandboxManagerMixin, SessionStoreMixin, ExecutorMixin, MediaMixin, st
                 continue
             file_list.append(f"- {file_meta['name']} -> {remote_path}")
 
-        if not file_list:
+        uploaded_map = getattr(self, "uploaded_session_files", None)
+        sessions_map = getattr(self, "sandbox_sessions", None)
+        already_uploaded = (
+            list(uploaded_map.get(session_id, ()))
+            if isinstance(uploaded_map, dict) and isinstance(sessions_map, dict) and session_id in sessions_map
+            else []
+        )
+
+        if not file_list and not already_uploaded:
             return
 
-        req.system_prompt += (
-            "\n\n[System Notice] The current session has cached user files that will be uploaded "
-            "to the E2B sandbox before code execution. Prefer reading them from these paths:\n"
-            + "\n".join(file_list)
-            + "\n[System Notice] If you want generated files to be available for delivery, save them under /home/user/uploads/. "
-            "The plugin will try to detect printed /home/user/... file paths automatically and cache matching outputs. "
-            "After generating a file, use e2b_sandbox_list_files to inspect cached candidates and e2b_sandbox_send_file to send the chosen file. "
-            "Do not call send_message_to_user with a file attachment that points to a sandbox path."
+        sections = []
+        if file_list:
+            sections.append(
+                "[System Notice] The current session has cached user files that will be uploaded "
+                "to the E2B sandbox before code execution. Prefer reading them from these paths:\n"
+                + "\n".join(file_list)
+            )
+        if already_uploaded:
+            sections.append(
+                "[System Notice] Files previously uploaded and still available in this session's sandbox:\n"
+                + "\n".join(f"- {path}" for path in already_uploaded)
+            )
+        sections.append(
+            "[System Notice] Save generated deliverable files under /home/user/uploads/ (or print their /home/user/... path), "
+            "then call e2b_sandbox_list_files and e2b_sandbox_send_file to deliver them. "
+            "Do not call send_message_to_user with a sandbox path."
         )
+        req.system_prompt += "\n\n" + "\n".join(sections)

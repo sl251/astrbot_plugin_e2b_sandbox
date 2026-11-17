@@ -1,22 +1,10 @@
-"""Authenticated, existing-session-only AstrBot dashboard adapter.
+"""带严格身份鉴权与只读本地快照脱敏的 AstrBot WebUI 管理台后端适配器。
 
-Integration (performed by the caller, not by this module):
-    from .web_panel import WebPanel
-    self._web_panel = WebPanel(self)
-    self._web_panel.register()
-    # Before the existing shutdown routine:
-    await self._web_panel.close()
-
-The inspected host discovers the shipped ``views/dashboard/index.html``;
-``pages`` is an alias and there is no register_web_page(). This module never
-writes a local file. register_web_api() takes route/handler/methods/description,
-not an auth scope. The host authenticates extension calls and binds
-astrbot.api.web.request. We additionally require a signed, unexpired dashboard
-JWT; the scoped asset token from a view URL is NOT a management credential.
-
-Snapshots read local tracking state only: no CREATE, CONNECT, cloud discovery,
-refresh/recovery, capacity admission, maintenance, or configuration mutation.
-No functions in this module are registered as LLM tools or message commands.
+设计约束：
+- 仅操作本插件实例已记录的会话，不提供创建沙箱、执行代码或跨会话批量销毁接口。
+- 除宿主本身的插件路由鉴权外，额外校验未过期的 AstrBot Dashboard HS256 JWT，
+  明确拒绝静态资源作用域 Token（防 Confused Deputy 混淆代理攻击）。
+- 快照接口纯读取本地追踪字典，绝不触发 CREATE / CONNECT 等唤醒或计费类云端请求。
 """
 
 import asyncio
@@ -38,6 +26,7 @@ from .constants import (
     DEFAULT_MAX_UPLOAD_FILE_SIZE_MB,
     DEFAULT_PAUSED_RETENTION_HOURS,
     DEFAULT_QUEUE_WAIT_TIMEOUT,
+    DEFAULT_SANDBOX_SCOPE,
     MAX_RETURN_FILE_SIZE_MB,
     PLUGIN_NAME,
 )
@@ -55,10 +44,11 @@ PUBLIC_HEADERS = {
 }
 _HEX_TOKEN = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_STATES = frozenset(("running", "paused", "starting", "unknown"))
+_SAFE_SCOPES = frozenset(("session", "group_member"))
 
 
 class PanelError(Exception):
-    """Only constant, public error messages may be sent to the browser."""
+    """仅允许将预定义的常量级公开错误文案返回给前端浏览器。"""
 
     def __init__(self, code, message, status_code=409):
         super().__init__(message)
@@ -84,7 +74,7 @@ def _bounded_int(value, default, minimum, maximum):
 
 
 class WebPanel:
-    """One adapter per plugin instance; requests do not outlive its close()."""
+    """每个插件实例独占一个适配器；close() 返回后不再遗留处理中的面板请求。"""
 
     def __init__(self, plugin):
         self.plugin = plugin
@@ -97,15 +87,14 @@ class WebPanel:
         self._closed = False
         self._plugin_version_cache = None
         self._tasks = {}
-        # Retain the exact handler objects: unregister must not remove a newly
-        # reloaded instance's routes or any other plugin's API.
+        # 保存当前实例绑定的方法引用，确保卸载时不会误删重载后新实例或其他插件注册的路由
         self._routes = (
             (SNAPSHOT_ROUTE, self._snapshot_view, ["GET"], "E2B 沙箱管理：脱敏本地快照"),
             (ACTION_ROUTE, self._action_view, ["POST"], "E2B 沙箱管理：暂停或销毁已有会话"),
         )
 
     def register(self):
-        """Fail closed on old hosts; do not add a Quart/public fallback."""
+        """在旧版宿主上安全关闭（Fail Closed），绝不回退注册无鉴权的公开路由。"""
         context = getattr(self.plugin, "context", None)
         register = getattr(context, "register_web_api", None)
         if self._closed or not callable(register):
@@ -144,15 +133,14 @@ class WebPanel:
         self.available = False
 
     async def close(self):
-        """Stop admitting requests, detach only our routes, finish locked work."""
+        """停止接受新请求、移除当前实例路由，并等待已进入锁作用域的管理任务完成。"""
         self._closed = True
         self.unregister()
         if self._tasks:
             await asyncio.gather(*tuple(self._tasks.values()), return_exceptions=True)
 
     def _authorize(self, request):
-        # username and plugin_name are injected by the authenticated host route,
-        # never taken from a request body, query parameter, or client header.
+        # username 与 plugin_name 由宿主鉴权网关注入，绝不采信请求体、Query 或客户端自定义头
         denied = PanelError("unauthorized", "请先登录 AstrBot WebUI。", 401)
         try:
             username = request.username
@@ -169,10 +157,6 @@ class WebPanel:
                 token = request.cookies.get(DASHBOARD_COOKIE, "")
             if not isinstance(token, str) or not token or len(token) > 16384:
                 raise denied
-            # The installed host itself uses this secret and the same JWT
-            # algorithm. Never read cmd_config.json or expose the secret.
-            # The host passes astrbot.api.web.request (a proxy) into handlers;
-            # resolve the bound PluginRequest before reading the raw app state.
             raw_request = request
             get_current = getattr(request, "_get_current", None)
             if callable(get_current):
@@ -186,9 +170,7 @@ class WebPanel:
             )
             if not isinstance(payload, dict) or payload.get("username") != username:
                 raise denied
-            # require_dashboard_user() on the inspected host checks username
-            # but not token_type. Prevent a signed view asset token being reused
-            # as a dashboard Bearer/cookie credential (confused deputy).
+            # 拦截页面静态资源受限 Token 被冒充为管理台凭据
             if any(name in payload for name in
                    ("token_type", "purpose", "plugin_name", "page_name")):
                 raise denied
@@ -238,8 +220,7 @@ class WebPanel:
             return ""
         pool = getattr(self.plugin, "_key_pool", None)
         raw_keys = getattr(pool, "_keys", {})
-        # Even an accidental key in a session name/sandbox ID must be masked.
-        # Do replacement BEFORE truncation so a prefix is not leaked.
+        # 在截断之前先按密钥从长到短完整脱敏，防止意外混入会话名或沙箱 ID 的密钥前缀泄露
         for key in sorted((v for v in raw_keys.values() if isinstance(v, str) and v),
                           key=len, reverse=True):
             value = value.replace(key, "[已脱敏]")
@@ -250,8 +231,7 @@ class WebPanel:
         return hmac.new(self._salt, session_id.encode("utf-8"), hashlib.sha256).hexdigest()
 
     def _version(self, session_id, meta):
-        # Include lifecycle identity AND status/times. Reusing the same sandbox
-        # ID after resume, changing ownership or replacing its record is stale.
+        # 同时绑定生命周期标识与状态时间戳，确保沙箱恢复、换绑或重建后旧快照令牌立即失效
         fields = [session_id]
         for name in ("sandbox_id", "key_id", "request_id", "status", "last_active", "paused_at"):
             value = meta.get(name)
@@ -264,7 +244,6 @@ class WebPanel:
     def _owner_known(self, meta):
         owner = meta.get("key_id")
         pool = getattr(self.plugin, "_key_pool", None)
-        # Deliberately do NOT use legacy_id, resolve(None), or pool.candidates().
         return isinstance(owner, str) and bool(owner) and owner in getattr(pool, "_keys", {})
 
     def _busy(self, session_id):
@@ -286,11 +265,16 @@ class WebPanel:
         return self._plugin_version_cache
 
     def snapshot(self):
-        """Whitelisted DTO, not vars(plugin), configuration, or SDK metadata."""
+        """构造严格白名单字段的只读 DTO，绝不导出插件原始配置字典或明文密钥。"""
         plugin = self.plugin
         pool = getattr(plugin, "_key_pool", None)
         order = list(getattr(pool, "_order", ()))
         labels = {identifier: f"Key #{index + 1}" for index, identifier in enumerate(order)}
+        alias_getter = getattr(pool, "alias", None)
+        aliases = {
+            identifier: self._public_text(alias_getter(identifier), 40) if callable(alias_getter) else ""
+            for identifier in order
+        }
         counts = {"total": 0, "running": 0, "paused": 0, "unknown": 0, "busy": 0}
         bound = {identifier: 0 for identifier in order}
         sessions = []
@@ -338,12 +322,14 @@ class WebPanel:
                 "busy": busy,
                 "key_label": labels.get(owner, "原所属 Key 未记录或未配置")
                              if isinstance(owner, str) else "原所属 Key 未记录或未配置",
+                "key_alias": aliases.get(owner, "") if isinstance(owner, str) else "",
                 "owner_known": owner_known,
                 "last_active": max(0.0, _number(meta.get("last_active"))),
                 "paused_at": max(0.0, _number(meta.get("paused_at"))),
                 "created_at": max(0.0, _number(meta.get("created_at"))),
                 "template": self._public_text(meta.get("template"), 120),
                 "pending_files": _bounded_int(len(getattr(plugin, "session_files", {}).get(session_id) or ()), 0, 0, 1000),
+                "uploaded_files": _bounded_int(len(getattr(plugin, "uploaded_session_files", {}).get(session_id) or ()), 0, 0, 1000),
                 "generated_files": _bounded_int(len(getattr(plugin, "generated_files", {}).get(session_id) or ()), 0, 0, 1000),
                 "can_pause": allowed and state != "paused",
                 "can_kill": allowed,
@@ -354,6 +340,7 @@ class WebPanel:
         cooldowns = getattr(pool, "_cooldown_until", {})
         keys = [{
             "label": labels[identifier],
+            "alias": aliases[identifier],
             "cooldown_seconds": math.ceil(max(0.0, _number(cooldowns.get(identifier)) - now)),
             "bound_sessions": bound[identifier],
             "available": math.ceil(max(0.0, _number(cooldowns.get(identifier)) - now)) <= 0,
@@ -363,6 +350,8 @@ class WebPanel:
         limit = _bounded_int(config.get("max_running_sandboxes"),
                              DEFAULT_MAX_RUNNING_SANDBOXES, 1, 20)
         occupied = len(getattr(capacity, "occupied", ()))
+        raw_scope = str(config.get("sandbox_scope", DEFAULT_SANDBOX_SCOPE) or DEFAULT_SANDBOX_SCOPE).strip()
+        scope = raw_scope if raw_scope in _SAFE_SCOPES else DEFAULT_SANDBOX_SCOPE
         return {
             "generated_at": time.time(),
             "source": "local_tracking_only",
@@ -385,6 +374,7 @@ class WebPanel:
                                                 DEFAULT_MAX_UPLOAD_FILE_SIZE_MB, 1, 100),
                 "return_file_limit_mb": _bounded_int(config.get("max_return_file_size_mb"),
                                                      DEFAULT_MAX_RETURN_FILE_SIZE_MB, 1, MAX_RETURN_FILE_SIZE_MB),
+                "sandbox_scope": scope,
             },
             "plugin": {
                 "version": self._plugin_version(),
@@ -454,8 +444,7 @@ class WebPanel:
         raise PanelError("target_missing", "目标会话已不存在，请刷新面板。", 404)
 
     async def _perform(self, session_id, data):
-        # The complete lock scope is in a shielded task. Disconnecting an HTTP
-        # caller must not release the lock while an SDK pause/kill is in flight.
+        # 将完整会话锁作用域封装在 shield 任务内，确保浏览器断连不会中途打断正在执行的云端暂停/销毁
         async with self.plugin._session_operation(session_id):
             self._ensure_running()
             if self._target(data) != session_id:
@@ -481,7 +470,6 @@ class WebPanel:
             if request.method != "POST":
                 raise PanelError("method_not_allowed", "此接口仅支持 POST。", 405)
             data = await self._action_body(request)
-            # body() yields: close() may have started since authentication.
             self._ensure_running()
             session_id = self._target(data)
             if self._busy(session_id):
@@ -492,7 +480,6 @@ class WebPanel:
             def finished(completed):
                 if self._tasks.get(session_id) is completed:
                     self._tasks.pop(session_id, None)
-                # Retrieve exceptions even if the HTTP caller has disappeared.
                 if not completed.cancelled():
                     completed.exception()
 
@@ -503,5 +490,4 @@ class WebPanel:
         except SandboxBusyError:
             return self._reply(error=PanelError("session_busy", "该会话正在执行或清理，操作未排队。"))
         except Exception:
-            # Never forward SDK exceptions, config values, local paths or stacks.
             return self._reply(error=PanelError("operation_failed", "云端操作未确认；请刷新面板检查，勿重复提交。", 502))

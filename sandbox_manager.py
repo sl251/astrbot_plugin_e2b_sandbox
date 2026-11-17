@@ -1,3 +1,5 @@
+"""沙箱生命周期管理：创建、重连、空闲自动暂停、到期销毁、异常找回与多 Key 并发创建调度。"""
+
 import asyncio
 import inspect
 import re
@@ -9,7 +11,6 @@ from contextlib import asynccontextmanager
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 
-from .runtime_capacity import SandboxBusyError
 from .api_keys import KeyInCooldownError
 from .constants import (
     DEFAULT_IDLE_PAUSE_SECONDS,
@@ -24,6 +25,8 @@ from .constants import (
     PLUGIN_NAME,
     SANDBOX_API_TIMEOUT,
 )
+from .runtime_capacity import SandboxBusyError
+
 
 class SandboxManagerMixin:
     async def initialize(self):
@@ -34,14 +37,13 @@ class SandboxManagerMixin:
         if self._maintenance_task:
             self._maintenance_task.cancel()
             await asyncio.gather(self._maintenance_task, return_exceptions=True)
-        # Await only the operation scope, not the host's entire message task.
-        # Otherwise reload can return while a locked execution still owns a VM.
+        # 仅等待已进入会话锁的操作作用域收尾，避免重载时遗漏正在执行代码的运行中沙箱
         if self._operation_completions:
             await asyncio.gather(*tuple(self._operation_completions))
         pending_tasks = self._cleanup_tasks | self._inflight_tasks
         if pending_tasks:
             await asyncio.gather(*pending_tasks, return_exceptions=True)
-        # Keep durable records when cleanup fails, so reloads do not forget a running VM.
+        # 卸载收尾暂停失败时保留本地持久化记录，确保新实例加载后不会遗忘仍在计费的虚拟机
         for session_id in list(self.sandbox_sessions):
             lock = self._get_session_lock(session_id)
             if lock.locked():
@@ -112,8 +114,7 @@ class SandboxManagerMixin:
 
     def _sdk_options(self, session_id=None, key_id=None):
         meta = self.sandbox_sessions.get(session_id, {}) if session_id else {}
-        # Existing VM operations must use the original account, never
-        # the round-robin key selected for the next new VM.
+        # 已有沙箱的管理动作必须使用原所属账户，严禁使用新沙箱轮询游标对应的 Key
         owner = key_id or meta.get("key_id")
         return {
             "api_key": self._key_pool.resolve(owner),
@@ -184,15 +185,17 @@ class SandboxManagerMixin:
         task = asyncio.create_task(self._pause_session_safely(session_id, sandbox))
         self._session_cleanup_tasks[session_id] = task
         self._cleanup_tasks.add(task)
+
         def finished(completed):
             self._cleanup_tasks.discard(completed)
             if self._session_cleanup_tasks.get(session_id) is completed:
                 self._session_cleanup_tasks.pop(session_id, None)
+
         task.add_done_callback(finished)
         return await asyncio.shield(task)
 
     async def _recover_uncertain_sandbox(self, session_id):
-        """Find a create whose response was lost, without issuing another create."""
+        """通过创建前持久化的 request_id 元数据找回响应丢失的沙箱，绝不盲目重复创建。"""
         meta = self.sandbox_sessions[session_id]
         request_id = meta.get("request_id")
         if not request_id or self._sandbox_sdk is None or self._sandbox_query is None or not hasattr(self._sandbox_sdk, "list"):
@@ -232,7 +235,7 @@ class SandboxManagerMixin:
             )
         except Exception as exc:
             if not self._is_sandbox_not_found(exc):
-                # A failed DELETE must not remove the only durable handle to this VM.
+                # 云端销毁未确认成功时保留本地唯一记录句柄，供后续重试
                 raise
         self._delete_sandbox_session(session_id)
         await self._capacity.release(session_id)
@@ -261,11 +264,11 @@ class SandboxManagerMixin:
             await self._capacity.release(session_id)
         elif state == "running":
             meta["status"] = "running"
-            # An out-of-band resume starts a new pause/retention cycle.
+            # 云端外部恢复运行后开启新一轮暂停保留计时
             meta.pop("paused_at", None)
             self._capacity.occupied.add(session_id)
         else:
-            # An unrecognised cloud state is not proof the VM is stopped.
+            # 未识别的云端状态不能视为已暂停，继续保留运行名额
             meta["status"] = "unknown"
             meta.pop("paused_at", None)
             self._capacity.occupied.add(session_id)
@@ -307,17 +310,9 @@ class SandboxManagerMixin:
                 except Exception as exc:
                     logger.warning(f"[E2B] Expired sandbox cleanup unconfirmed for {session_id}: {self._key_pool.redact(exc)}")
                     continue
-                self.session_last_access.pop(session_id, None)
-                self.code_hashes.pop(session_id, None)
-                self.code_hash_timestamps.pop(session_id, None)
-                self.session_files.pop(session_id, None)
-                self._file_event_ids.pop(session_id, None)
-                self.generated_files.pop(session_id, None)
-                self.sent_file_signatures.pop(session_id, None)
+                self._evict_session_memory_cache(session_id)
                 logger.info(f"[E2B] Cleaned expired session cache: {session_id}")
             self.session_locks.pop(session_id, None)
-
-        self._save_sandbox_sessions()
 
     async def _get_or_create_session_sandbox(
         self,
@@ -344,8 +339,7 @@ class SandboxManagerMixin:
                     "Kill the current sandbox before switching templates."
                 )
 
-            # Local configuration failures cannot have resumed a remote VM.
-            # Validate before reserving capacity or discarding paused_at.
+            # 在占用运行名额或修改暂停记录前先完成本地账户配置与 SDK 能力校验
             owner = sandbox_meta.get("key_id") or self._key_pool.legacy_id
             self._key_pool.resolve(owner)
             if getattr(self._sandbox_sdk, "connect", None) is None:
@@ -357,7 +351,7 @@ class SandboxManagerMixin:
                     status="starting", key_id=owner, require_persist=True,
                 )
             except Exception:
-                # A local write failure cannot have resumed a paused VM.
+                # 本地写盘失败时尚未向云端发送恢复请求，原本暂停的虚拟机可安全归还预留槽位
                 if sandbox_meta.get("status") == "paused":
                     await self._capacity.release(session_id)
                 raise
@@ -371,7 +365,7 @@ class SandboxManagerMixin:
                     self._delete_sandbox_session(session_id)
                     await self._capacity.release(session_id)
                 elif sandbox_meta.get("status") == "paused" and self._is_activation_rejected(exc):
-                    # An explicit rejection did not resume this paused VM.
+                    # 云端明确拒绝重连并未唤醒已暂停虚拟机，恢复原有暂停记录并释放槽位
                     self.sandbox_sessions[session_id] = sandbox_meta
                     self._save_sandbox_sessions()
                     await self._capacity.release(session_id)
@@ -399,8 +393,7 @@ class SandboxManagerMixin:
         await self._capacity.acquire(session_id)
         last_rejection = None
         try:
-            # A queued/cancelled request must not spend a rotation turn, and
-            # account availability may change while waiting for capacity.
+            # 排队获得运行槽位后再领取轮询候选，避免排队超时/取消白消耗轮换次序
             candidates = await self._key_pool.candidates()
             for key_id, api_key in candidates:
                 request_id = uuid.uuid4().hex
@@ -425,7 +418,7 @@ class SandboxManagerMixin:
                     if not sandbox_id:
                         raise RuntimeError("Sandbox created, but the SDK did not expose a sandbox ID.")
                 except KeyInCooldownError:
-                    # Rechecked under the creation lock; no RPC or record exists.
+                    # 在创建锁内重检发现该 Key 已进入冷却，尚未写状态也未发请求，直接换下一把
                     continue
                 except BaseException as exc:
                     status = self._api_error_status(exc)
@@ -434,15 +427,13 @@ class SandboxManagerMixin:
                         and self._key_pool.is_definitive_account_rejection(exc, status)
                     )
                     if not request_started or account_rejected or self._is_activation_rejected(exc):
-                        # Discard a definitively rejected attempt BEFORE waiting
-                        # for the next Key. Cancellation there must not recover it.
+                        # 明确被拒绝的创建尝试必须在切换下一把 Key 等待前先删除本地意图记录
                         self._delete_sandbox_session(session_id)
                         if request_started and account_rejected:
                             last_rejection = exc
                             continue
                     else:
-                        # A sent request with a lost response may have created a
-                        # VM. Keep its owner/request_id and never switch accounts.
+                        # 请求已发出但响应丢失（如超时/5xx）可能已在云端建出实例，保留归属等待找回，绝不跨账号重开
                         self.sandbox_sessions[session_id]["status"] = "unknown"
                         self._save_sandbox_sessions()
                         await self._finish_pause(session_id)
@@ -464,8 +455,7 @@ class SandboxManagerMixin:
                 f"Last error: {self._key_pool.redact(last_rejection)}"
             )
         finally:
-            # Includes cancellation before sending, rejected attempts and Keys
-            # skipped after queueing. Only possible/existing VMs retain capacity.
+            # 若最终未保留任何沙箱记录（取消、明确拒绝或全部冷却），立即归还预留容量
             if session_id not in self.sandbox_sessions:
                 await self._capacity.release(session_id)
 
@@ -519,8 +509,7 @@ class SandboxManagerMixin:
             deadline = time.monotonic() + call_timeout
             for attempt in range(3):
                 if attempt == 0 and on_start:
-                    # Persist at the actual invocation boundary, not before
-                    # scheduling this coroutine with wait_for().
+                    # 在实际执行 RPC 边界持久化激活意图
                     on_start()
                 activation_rejected = False
                 try:
@@ -545,7 +534,7 @@ class SandboxManagerMixin:
                     try:
                         await asyncio.sleep(delay)
                     except asyncio.CancelledError as cancelled:
-                        # No RPC is in flight while waiting after an explicit rejection.
+                        # 429 明确拒绝后的等待期间没有在途 RPC，标记已拒绝以便外层安全清理
                         cancelled.activation_rejected = True
                         raise
             raise RuntimeError(f"E2B SDK {action_name} retry limit reached.")
@@ -553,8 +542,7 @@ class SandboxManagerMixin:
         try:
             return await asyncio.wait_for(invoke(), timeout=call_timeout)
         except (asyncio.CancelledError, asyncio.TimeoutError) as exc:
-            # wait_for can replace the CancelledError raised during retry sleep
-            # with TimeoutError. Preserve the fact that no RPC is in flight.
+            # 保留重试休眠期间尚未发出新 RPC 的标记
             if activation_rejected:
                 exc.activation_rejected = True
             raise
@@ -607,16 +595,19 @@ class SandboxManagerMixin:
         else:
             raise RuntimeError("Current E2B SDK does not support sandbox creation.")
 
-        # Limit initial creates to Hobby's 1/sec, including failed attempts.
-        async with self._creation_lock:
-            key_id = self._key_pool.identifier(api_key)
+        # 双层锁并发模型（严格固定加锁顺序：先按 Key 锁 -> 后全局速率准入锁）：
+        # 1. 同一把 Key 的并发新建串行等待，首个 401/402/429 发布冷却后，同 Key 等待者零 RPC 跳过；
+        # 2. 全局 _creation_lock 仅用于预约 1.05s 发车间隔，不包裹耗时的海外网络 RPC，使多把不同 Key 真正并行创建。
+        key_id = self._key_pool.identifier(api_key)
+        async with self._key_pool.creation_lock(key_id):
             self._key_pool.ensure_available(key_id)
-            delay = self._next_creation_time - time.monotonic()
-            if delay > 0:
-                await asyncio.sleep(delay)
-            self._key_pool.ensure_available(key_id)
-            self._next_creation_time = time.monotonic() + 1.05
-            # Do not fallback after a timeout/5xx: the first RPC may have created a VM.
+            async with self._creation_lock:
+                self._key_pool.ensure_available(key_id)
+                delay = self._next_creation_time - time.monotonic()
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                self._key_pool.ensure_available(key_id)
+                self._next_creation_time = time.monotonic() + 1.05
             try:
                 return await self._call_sandbox_entrypoint(
                     method, create_kwargs, call_timeout=SANDBOX_API_TIMEOUT, action_name=action_name,
@@ -625,6 +616,6 @@ class SandboxManagerMixin:
             except Exception as exc:
                 status = self._api_error_status(exc)
                 if self._key_pool.is_definitive_account_rejection(exc, status):
-                    # Publish cooldown before unlocking, so queued creates see it.
+                    # 在释放该 Key 创建锁前发布冷却，确保同 Key 排队请求立即感知
                     self._key_pool.reject(key_id, status)
                 raise

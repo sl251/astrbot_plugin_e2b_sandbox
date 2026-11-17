@@ -1,11 +1,11 @@
-"""Bounded, FIFO admission for sandboxes that are running or may be running."""
+"""运行中或状态未确认沙箱的有界先入先出（FIFO）全局并发容量准入控制。"""
 
 import asyncio
 from collections import deque
 
 
 class SandboxBusyError(RuntimeError):
-    """The request cannot obtain a sandbox slot within the configured limits."""
+    """当前请求无法在配置的队列容量或等待超时限制内获取运行槽位。"""
 
 
 class RuntimeCapacity:
@@ -22,7 +22,7 @@ class RuntimeCapacity:
         return len(self._waiters)
 
     async def acquire(self, session_id):
-        """Reserve before create/connect; keep the reservation until confirmed stopped."""
+        """在创建或重连前预留槽位；槽位一直保留至确认暂停、销毁或未发送激活请求。"""
         async with self._condition:
             if session_id in self.occupied:
                 return

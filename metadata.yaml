@@ -1,38 +1,42 @@
 name: astrbot_plugin_e2b_sandbox
 author: sl251
-version: "1.4.2"
+version: "1.5.0"
 astrbot_version: ">=4.9.2"
-description: "E2B 云沙箱 Python 执行、会话持久化、多 API Key 轮询、容量排队与自动清理"
+description: "E2B 云沙箱 Python 执行、会话持久化、多 API Key 并行轮询、可视化管理台与安全防护"
 repo: "https://github.com/sl251/astrbot_plugin_e2b_sandbox"
 
 requirements:
   - e2b-code-interpreter>=2.3.0,<3.0.0
 
 configs:
-  e2b_api_key:
-    type: str
-    default: ""
-    description: "从 https://e2b.dev 获取的 API Key"
   e2b_api_keys:
     type: list
     default: []
-    description: "额外的 E2B API Key；与旧单 Key 配置合并去重，仅对新建沙箱轮询"
+    description: "E2B API Keys（主入口，支持多账户轮询与 `e2b_xxx # 备注名` 别名语法）"
+  e2b_api_key:
+    type: string
+    default: ""
+    description: "旧版单 Key（仅用于升级前创建的旧沙箱归属迁移，新安装留空）"
   timeout:
     type: int
     default: 60
-    description: "单次 Python 代码执行超时（秒）"
+    description: "单次 Python 代码执行超时（秒，最小 5）"
   max_output_length:
     type: int
     default: 2000
-    description: "返回给 LLM 的最大文本长度"
+    description: "返回给 LLM 的最大文本长度（字符，范围 200–20000）"
   proxy:
-    type: str
+    type: string
     default: ""
     description: "可选代理地址，例如 http://127.0.0.1:10809"
   default_template:
-    type: str
+    type: string
     default: ""
     description: "默认使用的 E2B Template ID，留空时使用默认环境"
+  sandbox_scope:
+    type: string
+    default: "session"
+    description: "沙箱隔离粒度：session（群聊全员共用）或 group_member（群聊按成员独立沙箱）"
   prefer_e2b_for_code:
     type: bool
     default: true
@@ -40,7 +44,7 @@ configs:
   hide_restricted_local_tools:
     type: bool
     default: true
-    description: "local 模式要求管理员时，为通过插件准入的非管理员隐藏当前请求的本机执行工具，保留文件工具和原有权限校验"
+    description: "local 模式要求管理员时，为通过插件准入的非管理员隐藏当前请求的本机执行工具"
   enable_user_whitelist:
     type: bool
     default: true
@@ -69,19 +73,19 @@ configs:
     type: int
     default: 30
     description: "空闲沙箱自动暂停时间（5–3600 秒）；正在执行的任务不会被空闲清理中断"
-  paused_sandbox_retention_hours:
-    type: int
-    default: 12
-    description: "后台每分钟检查，暂停超过此时长的沙箱会销毁（1–720 小时）；普通聊天不延长时间，销毁后变量和文件无法恢复"
   max_upload_file_size_mb:
     type: int
     default: 20
-    description: "单个 HTTP(S) 或本地附件上传上限（1–100 MB）；超限终止本次执行"
+    description: "单个公网 HTTP(S) 或本地附件上传上限（1–100 MB）；超限终止本次执行"
   max_return_file_size_mb:
     type: int
     default: 5
     description: "允许下载并发送给用户的单个生成文件大小上限（1–50 MB）"
+  paused_sandbox_retention_hours:
+    type: int
+    default: 12
+    description: "后台每分钟检查，暂停超过此时长的沙箱会销毁（1–720 小时）；销毁后变量和文件无法恢复"
   file_retention_hours:
     type: int
     default: 24
-    description: "data/plugin_data 中导出缓存文件的保留时长（小时）"
+    description: "data/plugin_data 中导出缓存文件的保留时长（1–168 小时）"

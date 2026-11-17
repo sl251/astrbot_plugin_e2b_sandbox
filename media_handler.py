@@ -1,3 +1,5 @@
+"""附件解析、防越权宿主机文件读取、云端产物快照收集与图片/文件回传处理。"""
+
 import asyncio
 import base64
 import hashlib
@@ -17,25 +19,62 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 from astrbot.api.message_components import Image
 
-from .file_transfer import download_http, read_limited
 from .constants import (
     DEFAULT_EXPORT_DIRNAME,
     DEFAULT_FILE_RETENTION_HOURS,
     DEFAULT_MAX_RETURN_FILE_SIZE_MB,
     DEFAULT_MAX_UPLOAD_FILE_SIZE_MB,
+    DEFAULT_PROXY,
     DEFAULT_UPLOAD_DIR,
     DEFAULT_WORK_DIR,
     MAX_GENERATED_FILE_CANDIDATES,
+    MAX_IMAGES_PER_EXECUTION,
     MAX_RETURN_FILE_SIZE_MB,
     MAX_SESSION_FILE_COUNT,
+    PENDING_UPLOAD_TTL_SECONDS,
     SANDBOX_PATH_PATTERN,
 )
+from .file_transfer import download_http, read_limited
 from .utils import shlex_quote
+
+_PLUGIN_SOURCE_ROOT = Path(__file__).resolve().parent
+_TEST_TMP_ROOT = (_PLUGIN_SOURCE_ROOT / ".test-tmp").resolve()
+_SENSITIVE_FILENAMES = frozenset({
+    "cmd_config.json",
+    "sandbox_sessions.json",
+    ".env",
+    "id_rsa",
+    "id_ed25519",
+    "authorized_keys",
+    "known_hosts",
+    "shadow",
+    "gshadow",
+    "passwd",
+})
+_SENSITIVE_PATH_PARTS = frozenset({".ssh", ".gnupg", ".aws", ".kube", ".docker"})
+_SAFE_CACHE_DIR_HINTS = frozenset({
+    "temp", "tmp", "cache", "caches", "attachments", "files",
+    "file_recv", "napcat", "lagrange", "llonebot", "onebot",
+})
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
 
 class MediaMixin:
     async def _stage_pending_files(self, event: AstrMessageEvent, sandbox, pending_files):
+        """将当前会话待上传附件写入沙箱 /home/user/uploads/，无附件时零 RPC 直接返回。"""
+        if not pending_files:
+            return []
+
         uploaded_paths = []
-        await sandbox.commands.run(f"mkdir -p {DEFAULT_UPLOAD_DIR}", timeout=30)
+        session_id = self._get_session_id(event)
+        await sandbox.commands.run(f"mkdir -p {shlex_quote(DEFAULT_UPLOAD_DIR)}", timeout=30)
         for file_meta in pending_files:
             file_payload = await self._resolve_file_payload(event, file_meta)
             if not file_payload:
@@ -44,13 +83,35 @@ class MediaMixin:
             remote_path = self._resolve_remote_path(file_payload["name"])
             await sandbox.files.write(remote_path, file_payload["content"])
             uploaded_paths.append(remote_path)
+            self._mark_file_uploaded(session_id, file_meta, remote_path)
 
         return uploaded_paths
 
+    def _mark_file_uploaded(self, session_id: str, file_meta: dict, remote_path: str):
+        """标记缓存附件已成功上传至当前沙箱，防止后续纯文本轮次重复上传。"""
+        target_id = file_meta.get("file_id") or file_meta.get("file") or file_meta.get("url")
+        target_name = file_meta.get("name")
+        for cached in self.session_files.get(session_id, ()):
+            cached_id = cached.get("file_id") or cached.get("file") or cached.get("url")
+            if (target_id and cached_id == target_id and cached.get("name") == target_name) or (
+                not target_id and cached.get("name") == target_name
+            ):
+                cached["awaiting_upload"] = False
+        uploaded_map = getattr(self, "uploaded_session_files", None)
+        if isinstance(uploaded_map, dict):
+            history = uploaded_map.setdefault(session_id, [])
+            if remote_path not in history:
+                history.append(remote_path)
+                if len(history) > MAX_SESSION_FILE_COUNT * 2:
+                    del history[:-MAX_SESSION_FILE_COUNT * 2]
+
     async def _resolve_file_payload(self, event: AstrMessageEvent, file_meta):
+        untrusted_raw = bool(file_meta.get("_untrusted_raw")) and not bool(file_meta.get("_trusted_hydrated"))
         source = self._extract_local_source(file_meta)
         if source and os.path.exists(source):
-            content = await asyncio.to_thread(self._read_local_file, source)
+            content = await asyncio.to_thread(
+                self._read_local_file, source, untrusted_source=untrusted_raw
+            )
             return {"name": file_meta.get("name") or os.path.basename(source), "content": content}
 
         file_url = self._extract_remote_url(file_meta)
@@ -62,7 +123,9 @@ class MediaMixin:
         fallback_url = await self._get_file_url_from_bot(event, file_meta)
         if fallback_url:
             if os.path.exists(fallback_url):
-                content = await asyncio.to_thread(self._read_local_file, fallback_url)
+                content = await asyncio.to_thread(
+                    self._read_local_file, fallback_url, untrusted_source=False
+                )
             else:
                 content = await asyncio.to_thread(self._download_url, fallback_url)
             if content is not None:
@@ -163,12 +226,17 @@ class MediaMixin:
         return None
 
     async def _handle_images(self, event: AstrMessageEvent, execution, streamed_results):
-        has_sent_image = False
+        """提取并投递执行生成的图表（单次最多投递 MAX_IMAGES_PER_EXECUTION 张，返回成功投递张数）。"""
+        sent_count = 0
         results = list(getattr(execution, "results", []) or [])
         if not results and streamed_results:
             results = streamed_results
 
         for res in results:
+            if sent_count >= MAX_IMAGES_PER_EXECUTION:
+                logger.info(f"[E2B] Reached per-execution image limit ({MAX_IMAGES_PER_EXECUTION}); skipping rest.")
+                break
+
             img_data, img_ext = self._extract_image_data(res)
             if not img_data:
                 continue
@@ -182,7 +250,7 @@ class MediaMixin:
             async def send_image_task(data, ext, evt):
                 tmp_path = None
                 try:
-                    await asyncio.sleep(0.3)
+                    await asyncio.sleep(0.25)
                     with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp_file:
                         tmp_file.write(data)
                         tmp_path = tmp_file.name
@@ -205,11 +273,10 @@ class MediaMixin:
                 asyncio.create_task(send_image_task(img_bytes, img_ext, event)),
                 self._inflight_tasks,
             )
-            has_sent_image = await asyncio.shield(task)
-            if has_sent_image:
-                break
+            if await asyncio.shield(task):
+                sent_count += 1
 
-        return has_sent_image
+        return sent_count
 
     async def _handle_generated_files(
         self,
@@ -219,7 +286,7 @@ class MediaMixin:
         hint_texts,
         before_snapshot,
     ):
-        self._cleanup_export_cache()
+        await asyncio.to_thread(self._cleanup_export_cache)
         self._cleanup_session_cache()
 
         session_id = self._get_session_id(event)
@@ -236,7 +303,7 @@ class MediaMixin:
 
         cached_files = []
         for file_name, file_bytes, remote_path, file_size, signature in generated_files:
-            local_path = self._write_export_file(file_name, file_bytes)
+            local_path = await asyncio.to_thread(self._write_export_file, file_name, file_bytes)
             if not local_path:
                 continue
 
@@ -311,6 +378,7 @@ class MediaMixin:
                                 "busid": data.get("busid"),
                                 "group_id": raw_message.get("group_id") or group_id,
                                 "user_id": raw_message.get("user_id") or user_id,
+                                "_untrusted_raw": True,
                             }
                         )
                     )
@@ -400,6 +468,7 @@ class MediaMixin:
                 local_path = local_paths.get(merged.get("name", ""))
                 if local_path:
                     merged["path"] = local_path
+                    merged["_trusted_hydrated"] = True
             hydrated.append(merged)
 
         return hydrated
@@ -421,12 +490,22 @@ class MediaMixin:
 
         return False
 
+    def _event_token(self, event: AstrMessageEvent):
+        """生成不持有 AstrMessageEvent 强引用的轻量消息令牌，避免会话缓存拖住上下文内存。"""
+        message_id = getattr(getattr(event, "message_obj", None), "message_id", None)
+        if message_id is not None:
+            return ("message", str(message_id))
+        return ("event_id", id(event))
+
     def _get_pending_files(self, event: AstrMessageEvent):
+        """合并当前消息附件与跨消息尚未消费的待上传附件（如 QQ 先发文档再发文字指令）。"""
+        now = time.time()
         current_files = self._extract_event_files(event)
         session_id = self._get_session_id(event)
-        message_id = getattr(getattr(event, "message_obj", None), "message_id", None)
-        token = ("message", str(message_id)) if message_id is not None else ("event", event)
-        same_event = self._file_event_ids.get(session_id) == token
+        token = self._event_token(event)
+        prev_token = self._file_event_ids.get(session_id)
+        # 兼容旧测试直接写入 ('event', event_obj) 形式的历史令牌
+        same_event = prev_token == token or prev_token == ("event", event)
         cached_files = self.session_files.get(session_id, [])
         cached_by_identity = {}
         cached_by_name = {}
@@ -435,18 +514,52 @@ class MediaMixin:
             if identity:
                 cached_by_identity[(item.get("name"), str(identity))] = item
             cached_by_name[item.get("name")] = item
+
         merged = []
+        current_keys = set()
         for item in current_files:
             item = dict(item)
             identity = item.get("file_id") or item.get("file") or item.get("url")
             previous = cached_by_identity.get((item.get("name"), str(identity))) if identity else None
             if previous is None and same_event and not identity:
                 previous = cached_by_name.get(item.get("name"))
-            if previous and not item.get("path"):
-                item["path"] = previous.get("path")
+            if previous:
+                if not item.get("path") and previous.get("path"):
+                    item["path"] = previous.get("path")
+                if previous.get("_trusted_hydrated"):
+                    item["_trusted_hydrated"] = True
+                if "awaiting_upload" in previous and same_event:
+                    item["awaiting_upload"] = previous["awaiting_upload"]
+                if "cached_at" in previous and same_event:
+                    item["cached_at"] = previous["cached_at"]
+            item.setdefault("awaiting_upload", True)
+            item.setdefault("cached_at", now)
             merged.append(item)
-        if not current_files and same_event:
-            merged = list(cached_files)
+            current_keys.add((item.get("name"), str(identity or "")))
+
+        if not current_files:
+            if same_event:
+                merged = list(cached_files)
+            else:
+                # 跨消息场景：仅保留通过 remember_session_files 缓存、尚未上传进沙箱且未过期的附件
+                merged = [
+                    dict(item)
+                    for item in cached_files
+                    if item.get("awaiting_upload") is True
+                    and (now - float(item.get("cached_at") or 0)) < PENDING_UPLOAD_TTL_SECONDS
+                ]
+        elif not same_event:
+            # 用户连续发了两个不同文件再提问时，保留前序尚未上传且未同名冲突的待传附件
+            carry_over = [
+                dict(item)
+                for item in cached_files
+                if item.get("awaiting_upload") is True
+                and (now - float(item.get("cached_at") or 0)) < PENDING_UPLOAD_TTL_SECONDS
+                and (item.get("name"), str(item.get("file_id") or item.get("file") or item.get("url") or "")) not in current_keys
+                and item.get("name") not in {m.get("name") for m in merged}
+            ]
+            merged = carry_over + merged
+
         self.session_files[session_id] = merged[-MAX_SESSION_FILE_COUNT:]
         self._file_event_ids[session_id] = token
         return list(self.session_files[session_id])
@@ -459,7 +572,7 @@ class MediaMixin:
         if not name and not file_meta.get("file_id"):
             return None
 
-        return {
+        normalized = {
             "name": str(name or file_meta.get("file_id")),
             "file": file_meta.get("file"),
             "file_id": file_meta.get("file_id"),
@@ -474,6 +587,11 @@ class MediaMixin:
             "group_id": file_meta.get("group_id"),
             "user_id": file_meta.get("user_id"),
         }
+        if file_meta.get("_untrusted_raw"):
+            normalized["_untrusted_raw"] = True
+        if file_meta.get("_trusted_hydrated"):
+            normalized["_trusted_hydrated"] = True
+        return normalized
 
     def _resolve_remote_path(self, name: str):
         raw_path = str(name).strip().replace("\\", "/")
@@ -507,16 +625,18 @@ class MediaMixin:
                 generated_paths.append(remote_path)
                 seen_paths.add(remote_path)
 
-        if not generated_paths:
-            for remote_path in self._extract_paths_from_texts(hint_texts):
-                if remote_path in seen_paths:
-                    continue
-                if self._basename(remote_path) in input_names:
-                    continue
-                if remote_path not in after_snapshot:
-                    continue
-                seen_paths.add(remote_path)
-                generated_paths.append(remote_path)
+        # 补充文本输出中显式打印的 /home/user/... 路径（包括超出快照扫描层级的深层子目录产物）
+        snapshot_had_changes = bool(generated_paths)
+        for raw_hint_path in self._extract_paths_from_texts(hint_texts):
+            remote_path = posixpath.normpath(raw_hint_path)
+            if not remote_path.startswith(f"{DEFAULT_WORK_DIR}/"):
+                continue
+            if remote_path in seen_paths or self._basename(remote_path) in input_names:
+                continue
+            if remote_path in after_snapshot and snapshot_had_changes:
+                continue
+            seen_paths.add(remote_path)
+            generated_paths.append(remote_path)
 
         if not generated_paths:
             return []
@@ -528,14 +648,20 @@ class MediaMixin:
             maximum=MAX_RETURN_FILE_SIZE_MB,
         ) * 1024 * 1024
 
-        candidates = []
+        # 先基于快照已有的大小元数据完成过滤与相关性预打分，仅对不在快照中的深层路径单独调用 stat
+        scored_paths = []
         for remote_path in generated_paths:
             file_name = self._basename(remote_path)
-            stat_result = await sandbox.commands.run(
-                f"stat -c %s {shlex_quote(remote_path)}",
-                timeout=15,
-            )
-            file_size = self._parse_int_output(stat_result)
+            snap_meta = after_snapshot.get(remote_path)
+            if snap_meta is not None:
+                file_size = snap_meta.get("size")
+            else:
+                stat_result = await sandbox.commands.run(
+                    f"stat -c %s {shlex_quote(remote_path)}",
+                    timeout=15,
+                )
+                file_size = self._parse_int_output(stat_result)
+
             if file_size is None:
                 logger.warning(f"[E2B] Failed to stat generated file: {remote_path}")
                 continue
@@ -548,6 +674,25 @@ class MediaMixin:
                 )
                 continue
 
+            score = self._score_generated_file(
+                remote_path,
+                file_name,
+                file_size,
+                hint_texts,
+                before_snapshot,
+                after_snapshot,
+            )
+            scored_paths.append((score, remote_path, file_name, file_size))
+
+        if not scored_paths:
+            return []
+
+        # 按得分从高到低依次下载校验，凑够 MAX_GENERATED_FILE_CANDIDATES 个有效文件即停止，避免全量拉取大量中间文件
+        scored_paths.sort(key=lambda item: item[0], reverse=True)
+        selected_candidates = []
+        for score, remote_path, file_name, file_size in scored_paths:
+            if len(selected_candidates) >= MAX_GENERATED_FILE_CANDIDATES:
+                break
             try:
                 content = await self._read_sandbox_file_bytes(sandbox, remote_path)
             except Exception as exc:
@@ -569,21 +714,11 @@ class MediaMixin:
                 logger.info(f"[E2B] Skip generated file {file_name}: duplicate in current session")
                 continue
 
-            score = self._score_generated_file(
-                remote_path,
-                file_name,
-                file_size,
-                hint_texts,
-                before_snapshot,
-                after_snapshot,
-            )
-            candidates.append((score, file_name, content, remote_path, file_size, signature))
+            selected_candidates.append((score, file_name, content, remote_path, file_size, signature))
 
-        if not candidates:
+        if not selected_candidates:
             return []
 
-        candidates.sort(key=lambda item: item[0], reverse=True)
-        selected_candidates = candidates[:MAX_GENERATED_FILE_CANDIDATES]
         logger.info(
             "[E2B] Cached generated file candidates: "
             + ", ".join(f"{item[1]} (score={item[0]})" for item in selected_candidates)
@@ -626,33 +761,32 @@ class MediaMixin:
         return score
 
     async def _snapshot_sandbox_files(self, sandbox):
+        """单条远端 find 命令采集 /home/user（3 层非隐藏目录）与 uploads 文件快照，减少往返延迟。"""
         snapshot = {}
-        search_dirs = [DEFAULT_UPLOAD_DIR, DEFAULT_WORK_DIR]
+        cmd = (
+            f"find {shlex_quote(DEFAULT_UPLOAD_DIR)} {shlex_quote(DEFAULT_WORK_DIR)} "
+            "-maxdepth 3 -not -path '*/.*' -type f -printf '%p\\t%s\\t%T@\\n' 2>/dev/null || true"
+        )
+        listing = await sandbox.commands.run(cmd, timeout=30)
+        stdout = getattr(listing, "stdout", "") or ""
+        if isinstance(stdout, list):
+            stdout = "".join(stdout)
 
-        for base_dir in search_dirs:
-            listing = await sandbox.commands.run(
-                f"find {shlex_quote(base_dir)} -maxdepth 1 -type f -printf '%p\\t%s\\t%T@\\n'",
-                timeout=30,
-            )
-            stdout = getattr(listing, "stdout", "") or ""
-            if isinstance(stdout, list):
-                stdout = "".join(stdout)
-
-            for line in stdout.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                parts = line.split("\t")
-                if len(parts) != 3:
-                    continue
-                remote_path, size_text, mtime_text = parts
-                try:
-                    snapshot[remote_path] = {
-                        "size": int(float(size_text)),
-                        "mtime": float(mtime_text),
-                    }
-                except (TypeError, ValueError):
-                    continue
+        for line in stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split("\t")
+            if len(parts) != 3:
+                continue
+            remote_path, size_text, mtime_text = parts
+            try:
+                snapshot[remote_path] = {
+                    "size": int(float(size_text)),
+                    "mtime": float(mtime_text),
+                }
+            except (TypeError, ValueError):
+                continue
 
         return snapshot
 
@@ -672,13 +806,11 @@ class MediaMixin:
         return paths
 
     def _extract_image_data(self, result):
+        """优先提取通用性最好的 PNG / JPEG 位图数据，无位图时再回退到 SVG。"""
         if hasattr(result, "png") and result.png:
             return result.png, ".png"
         if hasattr(result, "jpeg") and result.jpeg:
             return result.jpeg, ".jpg"
-        if hasattr(result, "svg") and result.svg:
-            encoded = base64.b64encode(str(result.svg).encode("utf-8")).decode("utf-8")
-            return encoded, ".svg"
 
         if hasattr(result, "formats"):
             formats_data = result.formats() if callable(result.formats) else result.formats
@@ -687,6 +819,10 @@ class MediaMixin:
                     return formats_data["png"], ".png"
                 if formats_data.get("jpeg"):
                     return formats_data["jpeg"], ".jpg"
+
+        if hasattr(result, "svg") and result.svg:
+            encoded = base64.b64encode(str(result.svg).encode("utf-8")).decode("utf-8")
+            return encoded, ".svg"
         return None, ""
 
     def _extract_url_or_path(self, payload):
@@ -748,7 +884,9 @@ class MediaMixin:
         return attrs
 
     def _download_url(self, url: str):
-        return download_http(url, self._max_upload_bytes())
+        config = getattr(self, "config", None) or {}
+        proxy = str(config.get("proxy", DEFAULT_PROXY) or "").strip() or None
+        return download_http(url, self._max_upload_bytes(), proxy=proxy)
 
     def _max_upload_bytes(self):
         return self._safe_int(
@@ -765,10 +903,51 @@ class MediaMixin:
             raise TypeError("E2B files.read(format='bytes') returned non-binary content")
         return bytes(content)
 
-    def _read_local_file(self, path: str):
-        if not Path(path).is_file():
+    def _validate_local_attachment_path(self, path: str, *, untrusted_source: bool = False) -> Path:
+        """校验本地附件路径合法性与安全边界，阻止读取宿主机配置、密钥文件或任意系统路径。"""
+        raw = Path(path)
+        resolved = raw.resolve()
+        if not resolved.is_file():
             raise ValueError("Attachment must be a regular file")
-        with open(path, "rb") as file_obj:
+
+        in_test_tmp = _is_within(resolved, _TEST_TMP_ROOT)
+        if not in_test_tmp and _is_within(resolved, _PLUGIN_SOURCE_ROOT):
+            raise ValueError("Reading files inside the plugin directory is forbidden.")
+
+        plugin_data_dir = getattr(self, "_plugin_data_dir", None)
+        if plugin_data_dir is not None and _is_within(resolved, Path(plugin_data_dir).resolve()):
+            raise ValueError("Reading files inside plugin_data is forbidden.")
+
+        lower_name = resolved.name.lower()
+        lower_parts = {part.lower() for part in resolved.parts}
+        if lower_name in _SENSITIVE_FILENAMES or (lower_parts & _SENSITIVE_PATH_PARTS):
+            raise ValueError("Attachment path targets a protected credential or configuration file.")
+
+        normalized_posix = resolved.as_posix().lower()
+        if normalized_posix.startswith(("/etc/", "/proc/", "/sys/", "/dev/")) or "/windows/system32/" in normalized_posix:
+            raise ValueError("Attachment path targets a restricted operating system directory.")
+
+        host_data_getter = getattr(self, "_host_data_path", None)
+        if callable(host_data_getter) and not in_test_tmp:
+            try:
+                host_data_root = Path(host_data_getter()).resolve()
+            except Exception:
+                host_data_root = None
+            if host_data_root is not None and _is_within(resolved, host_data_root):
+                rel_parts = {part.lower() for part in resolved.relative_to(host_data_root).parts[:-1]}
+                if not (rel_parts & _SAFE_CACHE_DIR_HINTS):
+                    raise ValueError("Reading AstrBot data files outside temporary attachment cache is forbidden.")
+
+        if untrusted_source and not in_test_tmp:
+            temp_root = Path(tempfile.gettempdir()).resolve()
+            if not _is_within(resolved, temp_root) and not (lower_parts & _SAFE_CACHE_DIR_HINTS):
+                raise ValueError("Untrusted raw attachment path is outside temporary cache directories.")
+
+        return resolved
+
+    def _read_local_file(self, path: str, *, untrusted_source: bool = False):
+        resolved = self._validate_local_attachment_path(path, untrusted_source=untrusted_source)
+        with open(resolved, "rb") as file_obj:
             max_bytes = self._max_upload_bytes()
             if os.fstat(file_obj.fileno()).st_size > max_bytes:
                 raise ValueError(f"Attachment exceeds the upload limit ({max_bytes} bytes).")

@@ -1,4 +1,4 @@
-"""Python injected into the sandbox; never downloads fonts on the Bot host."""
+"""注入到云端沙箱执行的绘图与中文字体初始化引导代码（绝不在 AstrBot 宿主机侧下载字体）。"""
 
 FONT_SETUP_CODE = r'''
 import os
@@ -7,8 +7,8 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 
-# Agg renders headlessly but its normal show() emits no notebook image. E2B
-# supplies display(); publish every open figure there and close after delivery.
+# Agg 无头后端默认的 show() 不会输出 Notebook 图像；通过 E2B 提供的 display()
+# 将所有打开的画布序列化为原始 PNG MIME 数据包回传，并在投递后关闭画布（直接覆盖赋值，天然幂等不递归）。
 if callable(globals().get('display')):
     def _e2b_show_figures(*args, **kwargs):
         import base64
@@ -16,8 +16,6 @@ if callable(globals().get('display')):
         for number in list(plt.get_fignums()):
             with io.BytesIO() as image:
                 plt.figure(number).savefig(image, format='png', bbox_inches='tight')
-                # E2B may serialize a Figure as chart-only data; publishing a
-                # raw PNG MIME bundle guarantees a deliverable image result.
                 display({'image/png': base64.b64encode(image.getvalue()).decode('ascii')}, raw=True)
         plt.close('all')
     plt.show = _e2b_show_figures
@@ -30,6 +28,11 @@ def _e2b_configure_font():
     import urllib.request
     from matplotlib.ft2font import FT2Font
 
+    # 同一持久沙箱内核若已完成验证且字体文件仍在磁盘上，直接复用内存态免重复解析
+    verified_path = getattr(fm, '_e2b_verified_font', '')
+    if isinstance(verified_path, str) and verified_path and os.path.exists(verified_path) and plt.rcParams.get('font.sans-serif'):
+        return
+
     def activate(path):
         face = FT2Font(path)
         if not face.get_char_index(ord('中')):
@@ -40,8 +43,9 @@ def _e2b_configure_font():
             fm.fontManager.addfont(path)
         plt.rcParams['font.sans-serif'] = [family, 'DejaVu Sans']
         plt.rcParams['axes.unicode_minus'] = False
+        fm._e2b_verified_font = path
 
-    # Prefer fonts baked into a custom template. Do not fetch on every execution.
+    # 优先激活自定义模板预装的中文字体，避免每次执行都发起下载
     for family in ('Noto Sans CJK SC', 'Noto Sans SC', 'WenQuanYi Zen Hei'):
         try:
             path = fm.findfont(fm.FontProperties(family=family), fallback_to_default=False)
@@ -62,8 +66,7 @@ def _e2b_configure_font():
             except Exception:
                 os.unlink(font_path)
 
-        # Noto CJK Sans 2.004, SIL Open Font License 1.1:
-        # https://github.com/notofonts/noto-cjk/blob/Sans2.004/LICENSE
+        # Noto CJK Sans 2.004（SIL Open Font License 1.1）
         url = ('https://raw.githubusercontent.com/notofonts/noto-cjk/'
                'Sans2.004/Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Regular.otf')
         limit = 24 * 1024 * 1024

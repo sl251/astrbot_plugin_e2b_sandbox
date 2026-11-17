@@ -1,3 +1,5 @@
+"""云端 Python 代码执行器：按需绘图字体引导、预装库毫秒级检测缓存、流式输出聚合与结果投递。"""
+
 import ast
 import asyncio
 import hashlib
@@ -9,16 +11,24 @@ import traceback
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 
-from .runtime_capacity import SandboxBusyError
-from .sandbox_bootstrap import FONT_SETUP_CODE
 from .constants import (
     DEFAULT_EXEC_TIMEOUT,
     DEFAULT_OUTPUT_LIMIT,
     DEFAULT_SANDBOX_TIMEOUT,
     IMPORT_PACKAGE_MAP,
     MAX_RESULT_LIMIT,
+    PLOT_IDENTIFIERS,
+    PLOT_MODULES,
 )
+from .runtime_capacity import SandboxBusyError
+from .sandbox_bootstrap import FONT_SETUP_CODE
 from .tools import sandbox_action
+from .utils import shlex_quote
+
+# 反向映射：用于远端快速调用 importlib.util.find_spec 检测包是否已预装，避免每次无谓启动 pip
+_PACKAGE_TO_MODULE = {pkg: mod for mod, pkg in IMPORT_PACKAGE_MAP.items()}
+_PLOT_ATTR_METHODS = frozenset({"plot", "hist", "boxplot", "scatter", "bar", "barh", "pie", "savefig"})
+
 
 class ExecutorMixin:
     @sandbox_action
@@ -34,8 +44,8 @@ class ExecutorMixin:
         重要说明：
         1. 同一个会话复用持久沙箱，需要时才创建或恢复。
         2. 支持常见 Python 库与联网请求。
-        3. 支持绘图，图片会自动发送给用户。
-        4. 如果当前会话里有用户刚发送的文件，插件会尝试自动上传到沙箱。
+        3. 支持绘图，图片会自动发送给用户（单次最多自动发送多张图表）。
+        4. 如果当前会话里有用户刚发送的文件，插件会自动上传到沙箱。
         5. 需要处理附件时，请优先从 /home/user/uploads/ 读取文件。
         6. 生成的文件会缓存，使用 list_files / send_file 选择并发送。
         7. 不要在顶层脚本里使用 return，直接 print 结果即可。
@@ -84,8 +94,19 @@ class ExecutorMixin:
             stage = "sandbox activation"
             try:
                 pending_files = self._get_pending_files(event)
+                # 仅以关键文件身份参与去重哈希，避免内部状态时间戳字段导致重复请求绕过去重
+                hash_files = [
+                    {
+                        "name": item.get("name"),
+                        "file_id": item.get("file_id"),
+                        "file": item.get("file"),
+                        "url": item.get("url"),
+                        "path": item.get("path"),
+                    }
+                    for item in pending_files
+                ]
                 hash_source = json.dumps(
-                    {"code": code_to_run, "files": pending_files},
+                    {"code": code_to_run, "files": hash_files},
                     ensure_ascii=False, sort_keys=True,
                 )
                 current_hash = hashlib.md5(hash_source.encode("utf-8")).hexdigest()
@@ -117,9 +138,8 @@ class ExecutorMixin:
                 full_code = self._build_execution_code(code_to_run)
 
                 stage = "code execution"
-                # Upload/install failures have not executed user code and must
-                # allow an immediate corrected retry. Once sent, retain the
-                # fingerprint even on timeout: remote side effects are uncertain.
+                # 附件上传与依赖安装失败时尚未运行用户代码，应允许立即修正重试；
+                # 一旦进入代码执行阶段，即便超时也需保留指纹，因为远端可能已产生副作用。
                 self.code_hashes[session_id] = current_hash
                 self.code_hash_timestamps[session_id] = time.time()
                 logger.info("[E2B] Running user code...")
@@ -160,11 +180,15 @@ class ExecutorMixin:
                     )
 
                 stage = "result delivery"
-                has_sent_image = await self._handle_images(event, execution, streamed_results)
-                if has_sent_image:
-                    llm_feedback.append(
-                        "[System Notification] Image generated successfully and sent to user interface."
+                sent_images = await self._handle_images(event, execution, streamed_results)
+                if sent_images:
+                    count = int(sent_images) if isinstance(sent_images, int) and not isinstance(sent_images, bool) else 1
+                    image_note = (
+                        "Image generated successfully and sent to user interface."
+                        if count == 1
+                        else f"{count} images generated successfully and sent to user interface."
                     )
+                    llm_feedback.append(f"[System Notification] {image_note}")
 
                 sent_files = await self._handle_generated_files(
                     event,
@@ -205,18 +229,23 @@ class ExecutorMixin:
                 result_text = self._truncate(result_text, output_limit)
 
                 completed = True
+                directives = ["[SYSTEM COMMAND: Execution Complete."]
+                if sent_images:
+                    directives.append("Generated chart(s) have already been delivered to the user.")
+                if sent_files:
+                    directives.append(
+                        "Generated files are cached locally; call e2b_sandbox_list_files and "
+                        "e2b_sandbox_send_file to deliver the chosen file."
+                    )
+                directives.append(pause_summary)
+                directives.append(
+                    "DO NOT pass /home/user/... sandbox paths to send_message_to_user. "
+                    "Explain the result to the user now.]"
+                )
                 return (
                     f"{result_text}\n\n"
                     "--------------------------------------------------\n"
-                    "[SYSTEM COMMAND: Execution Complete.\n"
-                    "1. If an image was generated, it has been delivered.\n"
-                    "2. If files were generated, they are cached locally in this session.\n"
-                    "3. Call e2b_sandbox_list_files to inspect candidates and e2b_sandbox_send_file to deliver the chosen file.\n"
-                    f"4. {pause_summary}\n"
-                    "5. Keeping a sandbox running requires allow_keep_running=true in plugin settings; idle sandboxes are still auto-paused.\n"
-                    "6. Use e2b_sandbox_status, e2b_sandbox_pause, e2b_sandbox_resume, or e2b_sandbox_kill to control lifecycle explicitly.\n"
-                    "7. DO NOT call send_message_to_user with /home/user/... sandbox file paths.\n"
-                    "8. Explain the result to the user now.]"
+                    + "\n".join(directives)
                 )
             except asyncio.CancelledError:
                 logger.warning("[E2B] Task cancelled; attempting to pause the sandbox.")
@@ -235,11 +264,26 @@ class ExecutorMixin:
                     await self._finish_pause(session_id, sandbox)
 
     async def _install_dependencies(self, sandbox, packages):
-        install_cmd = (
-            "python -m pip install --disable-pip-version-check --no-input "
-            + " ".join(packages)
+        """先在沙箱内快速检查缺失模块，仅对未预装的包执行 pip 安装，并按沙箱 ID 缓存已验证结果。"""
+        sandbox_id = self._extract_sandbox_id(sandbox)
+        verified_map = getattr(self, "_verified_sandbox_packages", None)
+        verified = verified_map.setdefault(sandbox_id, set()) if (verified_map is not None and sandbox_id) else set()
+        pending_packages = [pkg for pkg in packages if pkg not in verified]
+        if not pending_packages:
+            return
+
+        # 构造包名与模块名映射，在沙箱内通过 find_spec 毫秒级筛除默认镜像已预装的库
+        pairs = [(pkg, _PACKAGE_TO_MODULE.get(pkg, pkg)) for pkg in pending_packages]
+        pairs_json = json.dumps(pairs)
+        probe_py = (
+            "import importlib.util, json, subprocess, sys; "
+            f"pairs = json.loads({shlex_quote(pairs_json)}); "
+            "missing = [pkg for pkg, mod in pairs if importlib.util.find_spec(mod) is None]; "
+            "sys.exit(0 if not missing else subprocess.call("
+            "[sys.executable, '-m', 'pip', 'install', '--disable-pip-version-check', '--no-input', *missing]))"
         )
-        logger.info(f"[E2B] Auto-installing dependencies: {packages}")
+        install_cmd = f"python -c {shlex_quote(probe_py)}"
+        logger.info(f"[E2B] Checking/installing dependencies: {pending_packages}")
         install_result = await sandbox.commands.run(install_cmd, timeout=180)
 
         exit_code = getattr(install_result, "exit_code", 0)
@@ -247,11 +291,40 @@ class ExecutorMixin:
             stderr_text = getattr(install_result, "stderr", "") or getattr(install_result, "stdout", "")
             raise RuntimeError(f"Dependency installation failed: {stderr_text}".strip())
 
-    def _build_execution_code(self, code_to_run: str) -> str:
+        verified.update(pending_packages)
+
+    def _needs_plot_setup(self, code: str) -> bool:
+        """基于 AST 判断代码是否可能涉及绘图操作，避免纯计算或表格任务无条件加载 matplotlib。"""
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            return any(token in code for token in ("matplotlib", "plt", "seaborn", "wordcloud", ".plot"))
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name.split(".")[0] in PLOT_MODULES:
+                        return True
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                if node.module.split(".")[0] in PLOT_MODULES:
+                    return True
+            elif isinstance(node, ast.Name) and node.id in PLOT_IDENTIFIERS:
+                return True
+            elif isinstance(node, ast.Attribute) and node.attr in _PLOT_ATTR_METHODS:
+                return True
+        return False
+
+    def _build_execution_code(self, code_to_run: str, include_font_setup=None) -> str:
+        """按需拼装中文字体与无头绘图展示引导代码。"""
+        should_inject = self._needs_plot_setup(code_to_run) if include_font_setup is None else bool(include_font_setup)
+        if not should_inject:
+            return code_to_run
         return FONT_SETUP_CODE + "\n" + code_to_run
 
     def _detect_packages(self, code: str):
+        """基于 AST 提取顶层导入的第三方包，仅对真正的标识符引用 `plt` 补充 matplotlib。"""
         packages = set()
+        has_plt_identifier = False
         try:
             tree = ast.parse(code)
         except SyntaxError:
@@ -269,8 +342,10 @@ class ExecutorMixin:
                 package = IMPORT_PACKAGE_MAP.get(top_level)
                 if package:
                     packages.add(package)
+            elif isinstance(node, ast.Name) and node.id == "plt":
+                has_plt_identifier = True
 
-        if "plt" in code and "matplotlib" not in packages:
+        if has_plt_identifier and "matplotlib" not in packages:
             packages.add("matplotlib")
 
         return sorted(packages)
