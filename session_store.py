@@ -1,3 +1,5 @@
+"""沙箱会话持久化存储、用户准入白名单、群聊隔离作用域与内存缓存清理。"""
+
 import asyncio
 import json
 import math
@@ -11,10 +13,12 @@ from astrbot.api.event import AstrMessageEvent
 
 from .constants import (
     DEFAULT_DUPLICATE_EXEC_WINDOW_SECONDS,
+    DEFAULT_SANDBOX_SCOPE,
     DEFAULT_SESSION_RETENTION_HOURS,
     DEFAULT_TEMPLATE,
     PLUGIN_NAME,
 )
+
 
 class SessionStoreMixin:
     def _get_plugin_data_dir(self):
@@ -31,8 +35,7 @@ class SessionStoreMixin:
         try:
             with open(self._sandbox_state_path, "r", encoding="utf-8") as file_obj:
                 loaded = json.load(file_obj)
-            # Losing these records also loses account ownership and occupied
-            # slots. Never treat a corrupt file as a fresh installation.
+            # 丢失状态记录等同于丢失账户归属与运行槽位占用；损坏的状态文件绝不能静默当作空安装覆盖。
             if not isinstance(loaded, dict):
                 raise ValueError("Session state must be an object.")
             for session_id, meta in loaded.items():
@@ -50,8 +53,7 @@ class SessionStoreMixin:
                             or not math.isfinite(value) or value < 0):
                         raise ValueError("Invalid session timestamp.")
             self.sandbox_sessions = loaded
-            # Pre-1.4 session files have no owner identifier. The old single
-            # e2b_api_key is the only known owner; preserve that binding.
+            # 1.4 之前的旧状态文件没有记录账户指纹，使用旧版单 e2b_api_key 自动补写归属并持久化
             if self._key_pool.legacy_id:
                 changed = False
                 for meta in self.sandbox_sessions.values():
@@ -164,13 +166,11 @@ class SessionStoreMixin:
             "last_active": time.time(),
             "request_id": request_id or previous.get("request_id", ""),
             "key_id": key_id or previous.get("key_id", "") or self._key_pool.legacy_id,
-            # Legacy records did not store creation time; reconnecting is not
-            # creation. Keep it unknown instead of inventing a recent timestamp.
+            # 旧版记录未保存创建时间；恢复重连不是新建，保持为 0（未知）而不伪造最近时间
             "created_at": previous.get("created_at", 0) if previous else time.time(),
         }
         if self._save_sandbox_sessions() is False and require_persist:
-            # No activation has been sent yet. Restore memory as well as
-            # leaving the previous on-disk file intact.
+            # 此时尚未向云端发出激活请求，回滚内存记录并保持磁盘原文件不变
             if previous:
                 self.sandbox_sessions[session_id] = previous
             else:
@@ -178,11 +178,31 @@ class SessionStoreMixin:
             raise RuntimeError("Cannot persist E2B activation intent; activation was not sent.")
 
     def _delete_sandbox_session(self, session_id: str):
-        self.sandbox_sessions.pop(session_id, None)
-        # A replacement VM has none of the old VM's variables or side effects.
+        removed = self.sandbox_sessions.pop(session_id, None)
+        if isinstance(removed, dict) and removed.get("sandbox_id"):
+            verified = getattr(self, "_verified_sandbox_packages", None)
+            if isinstance(verified, dict):
+                verified.pop(removed["sandbox_id"], None)
+        # 销毁后的新虚拟机不再包含旧虚拟机的变量、已上传文件或执行副作用
         self.code_hashes.pop(session_id, None)
         self.code_hash_timestamps.pop(session_id, None)
+        uploaded = getattr(self, "uploaded_session_files", None)
+        if isinstance(uploaded, dict):
+            uploaded.pop(session_id, None)
         self._save_sandbox_sessions()
+
+    def _evict_session_memory_cache(self, session_id: str):
+        """统一释放单个已无活跃沙箱会话的内存缓存。"""
+        self.session_last_access.pop(session_id, None)
+        self.code_hashes.pop(session_id, None)
+        self.code_hash_timestamps.pop(session_id, None)
+        self.session_files.pop(session_id, None)
+        self._file_event_ids.pop(session_id, None)
+        self.generated_files.pop(session_id, None)
+        self.sent_file_signatures.pop(session_id, None)
+        uploaded = getattr(self, "uploaded_session_files", None)
+        if isinstance(uploaded, dict):
+            uploaded.pop(session_id, None)
 
     def _cleanup_session_cache(self):
         now = time.time()
@@ -196,13 +216,7 @@ class SessionStoreMixin:
         ]
 
         for session_id in expired_session_ids:
-            self.session_last_access.pop(session_id, None)
-            self.code_hashes.pop(session_id, None)
-            self.code_hash_timestamps.pop(session_id, None)
-            self.session_files.pop(session_id, None)
-            self._file_event_ids.pop(session_id, None)
-            self.generated_files.pop(session_id, None)
-            self.sent_file_signatures.pop(session_id, None)
+            self._evict_session_memory_cache(session_id)
             self.session_locks.pop(session_id, None)
             logger.info(f"[E2B] Cleaned expired session cache: {session_id}")
 
@@ -212,9 +226,24 @@ class SessionStoreMixin:
         if len(self.session_last_access) % 20 == 0:
             self._cleanup_session_cache()
 
+    def _is_group_event(self, event: AstrMessageEvent, base_origin: str) -> bool:
+        message_obj = getattr(event, "message_obj", None)
+        if message_obj is not None and getattr(message_obj, "group_id", None):
+            return True
+        raw_message = getattr(message_obj, "raw_message", None) if message_obj is not None else None
+        if isinstance(raw_message, dict) and raw_message.get("group_id"):
+            return True
+        return ":GroupMessage:" in str(base_origin or "")
+
     def _get_session_id(self, event: AstrMessageEvent):
-        return (
+        base = (
             getattr(event, "unified_msg_origin", None)
             or getattr(event, "session_id", None)
             or event.get_sender_id()
         )
+        scope = str(getattr(self, "config", {}).get("sandbox_scope", DEFAULT_SANDBOX_SCOPE) or DEFAULT_SANDBOX_SCOPE).strip()
+        if scope == "group_member" and self._is_group_event(event, base):
+            user_id = str(self._get_user_id(event) or "").strip()
+            if user_id:
+                return f"{base}#user:{user_id}"
+        return base

@@ -1,3 +1,5 @@
+"""注册给大语言模型（LLM）调用的 E2B 云沙箱 FunctionTool 工具定义与异常脱敏包装器。"""
+
 import traceback
 from dataclasses import dataclass, field
 from functools import wraps
@@ -10,6 +12,7 @@ from .runtime_capacity import SandboxBusyError
 
 
 def sandbox_action(method):
+    """捕获并发繁忙与未预期异常，并在日志与返回文本中统一脱敏 API Key。"""
     @wraps(method)
     async def wrapped(self, *args, **kwargs):
         try:
@@ -75,8 +78,8 @@ class CreateSandboxTool(FunctionTool):
     plugin: Any = field(repr=False, default=None)
     name: str = "e2b_sandbox_create"
     description: str = (
-        "Create a sandbox for the current session. "
-        "If a sandbox already exists, this returns its status instead of creating a duplicate."
+        "Explicitly pre-warm a sandbox for the current session without running code. "
+        "Not needed before e2b_sandbox_run_python_code, which creates or reuses one automatically."
     )
     parameters: dict = field(
         default_factory=lambda: {

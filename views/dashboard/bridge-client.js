@@ -1,10 +1,7 @@
-/* Cancellable transport for the installed AstrBot postMessage bridge.
- * The host SDK's apiGet/apiPost do not expose cancellation, and its private
- * promise map retains never-answered calls. Use the SAME documented wire
- * channel/actions with our own bounded pending map; ready/theme still use SDK.
- * Abort removes listeners/timers and ignores late replies. The host protocol
- * has no HTTP-abort action: cancellation cannot retract an already sent RPC.
- * No credential, client storage, network or parent DOM access.
+/* 面向 AstrBot 页面 postMessage 桥接的可取消通信客户端。
+ * 宿主自带 SDK 的 apiGet/apiPost 不支持取消，且未响应请求会一直滞留在私有 Map 中。
+ * 本模块复用宿主标准通信频道与消息动作，维护有界请求表；就绪握手与主题监听仍调用宿主 SDK。
+ * 取消请求会立即清理监听器与定时器并忽略迟到响应；不访问凭据、本地存储、外部网络或父窗口 DOM。
  */
 (function attachE2BBridgeClient(root) {
   'use strict';
@@ -94,8 +91,7 @@
       const entry = pending.get(message.requestId);
       if (!entry) return;
       if (message.ok !== true) {
-        // The host bridge collapses HTTP errors to an unstructured string.
-        // Do not echo it: it might contain a URL, token, config or a stack.
+        // 宿主桥接会将底层异常折叠为非结构化字符串，禁止原样回显以防泄露路径、令牌或调用栈
         entry.finish(new PanelClientError('bridge_error', '请求被拒绝或未完成，请检查登录、目标状态并刷新。'));
         return;
       }
@@ -144,8 +140,7 @@
         if (action === 'api:post') payload.body = body;
         else payload.params = {};
         try {
-          // location.href yields the serving origin even in the host's opaque
-          // iframe, and resolveParentOrigin ensures it is never 'null' or '*'.
+          // 从页面地址解析真实服务源，并确保目标源绝不为 null 或通配符
           windowObject.parent.postMessage(payload, expectedParentOrigin);
         } catch {
           finish(new PanelClientError('bridge_error', '无法连接宿主桥接，请从插件详情页重新打开。'));
