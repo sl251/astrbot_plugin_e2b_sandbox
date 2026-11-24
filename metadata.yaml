@@ -5,6 +5,12 @@ astrbot_version: ">=4.9.2"
 description: "E2B 云沙箱 Python 执行、会话持久化、多 API Key 并行轮询、可视化管理台与安全防护"
 repo: "https://github.com/sl251/astrbot_plugin_e2b_sandbox"
 
+views:
+  - name: dashboard
+    target: plugin_page
+    title: "E2B 云沙箱控制台"
+    description: "查看云沙箱实例、并发运行槽位、API Key 轮询池与运行配额"
+
 requirements:
   - e2b-code-interpreter>=2.3.0,<3.0.0
 

@@ -843,6 +843,240 @@ vm.runInNewContext(code, {
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("panel DOM assertions passed", result.stdout)
 
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable; bridge error mapping check skipped")
+    def test_bridge_maps_exact_public_errors_and_propagates_session(self):
+        script = r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+const assert = require('node:assert/strict');
+const {randomUUID} = require('node:crypto');
+const listeners = new Set();
+const posted = [];
+const parent = {postMessage: (value, origin) => posted.push({value, origin})};
+const fake = {
+  crypto: {randomUUID}, URL,
+  location: {href: 'https://webui.example/api/v1/plugins/p/views/dashboard/_t/tok/'},
+  parent, setTimeout, clearTimeout,
+  addEventListener: (name, listener) => { if (name === 'message') listeners.add(listener); },
+  removeEventListener: (name, listener) => { listeners.delete(listener); },
+};
+vm.runInNewContext(fs.readFileSync(process.argv[1], 'utf8'), {window: fake});
+const emit = (data) => {
+  for (const listener of [...listeners]) listener({data, origin: 'https://webui.example', source: parent});
+};
+(async () => {
+  const client = fake.E2BPanelBridge.createClient(fake, 50);
+  // 模拟宿主下发带 session 的 context，后续请求应自动透传 session
+  emit({channel: 'astrbot-plugin-page', kind: 'context', session: 'sess-xyz', context: {}});
+
+  const stale = client.act({action: 'pause'});
+  assert.equal(posted[0].value.session, 'sess-xyz');
+  emit({
+    channel: 'astrbot-plugin-page', kind: 'response', requestId: posted[0].value.requestId,
+    ok: false, error: '该会话的沙箱或版本已变化，请刷新后重新确认。',
+  });
+  try { await stale; assert.fail('must reject'); } catch (error) {
+    assert.equal(error.code, 'stale_target');
+    assert.ok(error.message.includes('版本已变化'));
+  }
+
+  const busy = client.act({action: 'kill'});
+  emit({
+    channel: 'astrbot-plugin-page', kind: 'response', requestId: posted[1].value.requestId,
+    ok: false, error: '该会话正在执行或清理，请稍后刷新；操作不会排队。',
+  });
+  try { await busy; assert.fail('must reject'); } catch (error) {
+    assert.equal(error.code, 'session_busy');
+  }
+
+  // 非白名单未知错误（即使包含白名单前缀）也必须严格折叠脱敏
+  const unknown = client.act({action: 'kill'});
+  emit({
+    channel: 'astrbot-plugin-page', kind: 'response', requestId: posted[2].value.requestId,
+    ok: false, error: '请先登录 AstrBot WebUI。 Traceback /secret/key',
+  });
+  try { await unknown; assert.fail('must reject'); } catch (error) {
+    assert.equal(error.code, 'bridge_error');
+    assert(!error.message.includes('Traceback'));
+    assert(!error.message.includes('/secret/key'));
+  }
+  client.destroy();
+  console.log('bridge public error allowlist assertions passed');
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+"""
+        node = shutil.which("node")
+        assert node is not None
+        result = subprocess.run([node, "-e", script, str(DASHBOARD / "bridge-client.js")],
+                                capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("bridge public error allowlist assertions passed", result.stdout)
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable; redesign regression check skipped")
+    def test_panel_tri_state_theme_tabs_cooldown_peak_and_file_counts(self):
+        script = r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+const assert = require('node:assert/strict');
+
+class FakeEl {
+  constructor(tag, id = '') {
+    this.tagName = tag.toUpperCase();
+    this.id = id;
+    this.children = [];
+    this.attributes = {};
+    this.listeners = new Map();
+    this.className = '';
+    this.hidden = false;
+    this.disabled = false;
+    this.checked = true;
+    this.value = '';
+    this.open = false;
+    this.isConnected = true;
+    this.style = {};
+    this._text = '';
+  }
+  get textContent() { return this._text; }
+  set textContent(v) { this._text = String(v); }
+  setAttribute(k, v) { this.attributes[k] = String(v); }
+  getAttribute(k) { return this.attributes[k]; }
+  appendChild(c) { if (c && c._frag) this.children.push(...c.children); else this.children.push(c); return c; }
+  replaceChildren(...nodes) { this.children = []; nodes.forEach((n) => this.appendChild(n)); }
+  addEventListener(n, fn) { if (!this.listeners.has(n)) this.listeners.set(n, []); this.listeners.get(n).push(fn); }
+  dispatch(n, ev = {}) { const e = {preventDefault: () => {}, ...ev}; (this.listeners.get(n) || []).forEach((fn) => fn(e)); }
+  focus() {}
+  showModal() { this.open = true; }
+  close() { this.open = false; }
+}
+
+const ids = [
+  'refresh-button', 'auto-refresh', 'poll-state', 'theme-toggle', 'theme-label',
+  'notice-bar', 'notice', 'retry-button', 'tab-sessions', 'tab-keys', 'tab-keys-dot',
+  'tabpanel-sessions', 'tabpanel-keys', 'view-switch-wrap', 'sessions-region',
+  'session-list', 'session-search', 'status-filter', 'previous-page', 'next-page',
+  'page-label', 'key-list', 'kpi-running-card', 'kpi-keys-card', 'confirm-dialog',
+  'confirm-action', 'cancel-action', 'pause-ack', 'kill-id', 'action-feedback',
+];
+const els = new Map(ids.map((id) => [id, new FakeEl('div', id)]));
+els.get('status-filter').value = 'all';
+els.get('tabpanel-keys').hidden = true;
+const docEl = new FakeEl('html');
+const metaScheme = new FakeEl('meta');
+let contextCb = null;
+let snapCall = 0;
+
+const fakeDoc = {
+  hidden: false,
+  documentElement: docEl,
+  activeElement: null,
+  getElementById: (id) => els.get(id) || null,
+  querySelector: (sel) => (sel === 'meta[name="color-scheme"]' ? metaScheme : null),
+  createElement: (t) => new FakeEl(t),
+  createDocumentFragment: () => ({_frag: true, children: [], appendChild(c) { this.children.push(c); }}),
+  addEventListener: () => {},
+};
+class PanelClientError extends Error {}
+const snapshots = [
+  {
+    source: 'local_tracking_only',
+    generated_at: 1700000000,
+    counts: {total: 1, running: 1, paused: 0, unknown: 0, busy: 0},
+    capacity: {limit: 3, occupied: 1, available: 2, waiting: 0, max_queue: 10},
+    keys: [{label: 'Key #1', alias: '主力', bound_sessions: 1, cooldown_seconds: 240, available: false}],
+    sessions: [{
+      session_ref: 'a'.repeat(64), session_label: 'aiocqhttp:GroupMessage:123',
+      sandbox_id: 'sbx-1', version: 'b'.repeat(64), status: 'running',
+      key_label: 'Key #1', pending_files: null, uploaded_files: 2, generated_files: 1,
+      owner_known: true, can_pause: true, can_kill: true,
+    }],
+  },
+  {
+    source: 'local_tracking_only',
+    generated_at: 1700000060,
+    counts: {total: 1, running: 1, paused: 0, unknown: 0, busy: 0},
+    capacity: {limit: 3, occupied: 1, available: 2, waiting: 0, max_queue: 10},
+    keys: [{label: 'Key #1', alias: '主力', bound_sessions: 1, cooldown_seconds: 180, available: false}],
+    sessions: [],
+  },
+];
+const fakeWin = {
+  document: fakeDoc,
+  HTMLElement: FakeEl,
+  parent: {},
+  AstrBotPluginView: {
+    ready: async () => ({pluginName: 'astrbot_plugin_e2b_sandbox', isDark: true}),
+    onContext: (cb) => { contextCb = cb; return () => {}; },
+  },
+  E2BPanelBridge: {
+    PanelClientError,
+    createClient: () => ({
+      getSnapshot: async () => snapshots[Math.min(snapCall++, snapshots.length - 1)],
+      act: async () => ({}),
+      destroy: () => {},
+    }),
+  },
+  setTimeout: () => 1, clearTimeout: () => {}, setInterval: () => 2, clearInterval: () => {},
+  addEventListener: () => {},
+};
+vm.runInNewContext(fs.readFileSync(process.argv[1], 'utf8'), {
+  window: fakeWin, document: fakeDoc, HTMLElement: FakeEl, AbortController,
+  Date, Math, Number, String, Array, Object, Promise, Error, Set,
+});
+(async () => {
+  await new Promise((r) => setTimeout(r, 20));
+  // 1. 默认跟随宿主深色，点击三态切换：auto -> light -> dark -> auto
+  assert.equal(docEl.getAttribute('data-theme-mode'), 'auto');
+  assert.equal(docEl.getAttribute('data-theme'), 'dark');
+  assert.equal(els.get('theme-label').textContent, '跟随宿主');
+
+  els.get('theme-toggle').dispatch('click');
+  assert.equal(docEl.getAttribute('data-theme-mode'), 'light');
+  assert.equal(docEl.getAttribute('data-theme'), 'light');
+  assert.equal(els.get('theme-label').textContent, '浅色');
+  // 手动覆盖期间，宿主发来 isDark:true 不得冲掉手动浅色
+  contextCb({isDark: true});
+  assert.equal(docEl.getAttribute('data-theme'), 'light');
+
+  els.get('theme-toggle').dispatch('click');
+  assert.equal(docEl.getAttribute('data-theme-mode'), 'dark');
+  assert.equal(els.get('theme-label').textContent, '深色');
+
+  els.get('theme-toggle').dispatch('click');
+  assert.equal(docEl.getAttribute('data-theme-mode'), 'auto');
+  assert.equal(docEl.getAttribute('data-theme'), 'dark');
+  contextCb({isDark: false});
+  assert.equal(docEl.getAttribute('data-theme'), 'light');
+
+  // 2. 附件缺失边界：pending_files 为 null 时 uploaded_files=2 仍正确展示
+  const row = els.get('session-list').children[0];
+  const inPill = row.children[4].children[0].children[0];
+  assert.equal(inPill.textContent, '↑ 入箱 2');
+
+  // 3. 冷却峰值记忆：首次 240s（峰值 300s），二次刷新 180s 应为 60% 而非跳回 100%
+  assert.equal(els.get('tab-keys-dot').hidden, false);
+  els.get('refresh-button').dispatch('click');
+  await new Promise((r) => setTimeout(r, 20));
+  const keyCard = els.get('key-list').children[0];
+  const cooldownBar = keyCard.children[2].children[0];
+  assert.equal(cooldownBar.style.width, '60%');
+
+  // 4. Tab 切换与视图切换器显隐联动
+  els.get('tab-keys').dispatch('click');
+  assert.equal(els.get('tabpanel-sessions').hidden, true);
+  assert.equal(els.get('tabpanel-keys').hidden, false);
+  assert.equal(els.get('view-switch-wrap').hidden, true);
+  els.get('kpi-running-card').dispatch('click');
+  assert.equal(els.get('tabpanel-sessions').hidden, false);
+  assert.equal(els.get('status-filter').value, 'running');
+  console.log('redesign regression assertions passed');
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+"""
+        node = shutil.which("node")
+        assert node is not None
+        result = subprocess.run([node, "-e", script, str(DASHBOARD / "panel.js")],
+                                capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("redesign regression assertions passed", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
