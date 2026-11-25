@@ -25,6 +25,35 @@
     invalid_body: '操作请求格式无效，请刷新面板。',
   });
 
+  // 宿主 PluginViewFrame 对 4xx/5xx 响应会将后端公开文案折叠进 ok:false 的纯字符串 error。
+  // 仅精确匹配后端 web_panel.py 预设的常量级公开文案，绝不原样回显任意未知错误字符串，防止泄露路径、令牌或调用栈。
+  const EXACT_PUBLIC_MESSAGES = Object.freeze({
+    '请先登录 AstrBot WebUI。': 'unauthorized',
+    '插件正在停止，请稍后刷新。': 'stopping',
+    '暂时无法读取本地快照。': 'snapshot_failed',
+    '操作请求必须使用 JSON。': 'invalid_body',
+    '操作请求体过大或无效。': 'invalid_body',
+    '操作请求格式无效。': 'invalid_body',
+    '请明确确认目标沙箱后再操作。': 'confirmation_required',
+    '面板仅支持暂停或销毁已有沙箱。': 'unsupported_action',
+    '目标版本无效，请刷新面板。': 'invalid_target',
+    '目标沙箱 ID 无效。': 'invalid_target',
+    '该会话的沙箱或版本已变化，请刷新后重新确认。': 'stale_target',
+    '目标会话已变化，请刷新面板。': 'stale_target',
+    '目标标识无法安全展示，已拒绝操作。': 'invalid_target',
+    '原所属 API Key 未记录或已移除，不能换 Key 操作。': 'owner_missing',
+    '目标沙箱存在重复会话记录，已拒绝操作。': 'ambiguous_target',
+    '目标会话已不存在，请刷新面板。': 'target_missing',
+    '暂停尚未确认；会话记录与容量保留，请刷新后检查。': 'pause_unconfirmed',
+    '暂停状态尚未确认，请刷新后检查。': 'pause_unconfirmed',
+    '销毁状态尚未确认；记录保留，请刷新后检查。': 'kill_unconfirmed',
+    '该会话正在执行或清理，请稍后刷新；操作不会排队。': 'session_busy',
+    '该会话正在执行或清理，操作未排队。': 'session_busy',
+    '云端操作未确认；请刷新面板检查，勿重复提交。': 'operation_failed',
+  });
+
+  const hasOwn = (obj, key) => Object.prototype.hasOwnProperty.call(obj, key);
+
   class PanelClientError extends Error {
     constructor(code, message) {
       super(message);
@@ -76,6 +105,17 @@
     return parsed.origin;
   }
 
+  function mapBridgeFailure(rawError) {
+    const text = typeof rawError === 'string'
+      ? rawError.trim()
+      : (rawError && typeof rawError.message === 'string' ? rawError.message.trim() : '');
+    if (text && hasOwn(EXACT_PUBLIC_MESSAGES, text)) {
+      const code = EXACT_PUBLIC_MESSAGES[text];
+      return new PanelClientError(code, PUBLIC_CODES[code]);
+    }
+    return new PanelClientError('bridge_error', '请求被拒绝或未完成，请检查登录、目标状态并刷新。');
+  }
+
   function createClient(windowObject, timeoutMs = 30000) {
     const expectedParentOrigin = resolveParentOrigin(windowObject);
     const pending = new Map();
@@ -84,6 +124,9 @@
     let sequence = 0;
     let destroyed = false;
 
+    // 本插件仅以 target=plugin_page 嵌入 AstrBot PluginViewFrame；该宿主协议不发送也不校验 session
+    // （仅 chat_message 卡片使用 session），故不维护可变 bridgeSession 状态并忽略消息中的 session 字段。
+    // 请求关联完全依赖本客户端生成的 requestId 与严格 parent source/origin 校验，认证边界与白名单 endpoint 不降级。
     const onMessage = (event) => {
       if (event.source !== windowObject.parent || event.origin !== expectedParentOrigin) return;
       const message = event.data;
@@ -91,14 +134,13 @@
       const entry = pending.get(message.requestId);
       if (!entry) return;
       if (message.ok !== true) {
-        // 宿主桥接会将底层异常折叠为非结构化字符串，禁止原样回显以防泄露路径、令牌或调用栈
-        entry.finish(new PanelClientError('bridge_error', '请求被拒绝或未完成，请检查登录、目标状态并刷新。'));
+        entry.finish(mapBridgeFailure(message.error));
         return;
       }
       const payload = message.data;
       if (payload && payload.status === 'error') {
         const code = payload.data && typeof payload.data.code === 'string' ? payload.data.code : '';
-        const knownCode = Object.prototype.hasOwnProperty.call(PUBLIC_CODES, code);
+        const knownCode = hasOwn(PUBLIC_CODES, code);
         entry.finish(new PanelClientError(knownCode ? code : 'request_failed', knownCode ? PUBLIC_CODES[code] : '请求未完成，请刷新检查。'));
         return;
       }

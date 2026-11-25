@@ -3,9 +3,13 @@
   'use strict';
   const POLL_MS = 10000;
   const TICK_MS = 1000;
+  const TOAST_MS = 2600;
   const FAILURE_LIMIT = 3;
   const BRIDGE_READY_MS = 8000;
+  const COMPACT_CARD_WIDTH = 704;
   const VALID_PAGE_SIZES = Object.freeze([10, 20, 50]);
+  const THEME_MODES = Object.freeze(['auto', 'light', 'dark']);
+  const THEME_LABELS = Object.freeze({auto: '跟随宿主', light: '浅色', dark: '深色'});
   const STATUS_LABELS = Object.freeze({
     running: '运行中',
     paused: '已休眠',
@@ -29,18 +33,18 @@
     kook: 'KOOK',
   });
   const BLOCKED_LABELS = Object.freeze({
-    busy: '会话正在执行或收尾中，操作不会排队。',
-    owner_missing: '原所属 Key 未记录或已移除，禁止跨 Key 操作。',
-    identity_unconfirmed: '尚未确认目标沙箱 ID，暂不支持管理操作。',
-    stopping: '插件正在停止，暂不接受管理操作。',
-    session_busy: '该会话正在执行或收尾，操作未排队。',
-    stale_target: '目标沙箱或版本已变化，请刷新后重新确认。',
+    busy: '正在执行中',
+    owner_missing: '原 Key 已移除',
+    identity_unconfirmed: '沙箱 ID 待确认',
+    stopping: '插件停止中',
+    session_busy: '该会话正在执行或清理，操作未排队。',
+    stale_target: '目标沙箱或版本已变化，请刷新后重试。',
     target_missing: '目标会话已不存在，请刷新面板。',
-    ambiguous_target: '目标沙箱存在重复会话记录，已拒绝操作。',
-    invalid_target: '目标标识无效，请刷新后重新确认。',
-    pause_unconfirmed: '暂停尚未确认，会话与容量记录仍保留，请刷新检查。',
-    kill_unconfirmed: '销毁尚未确认，会话记录仍保留，请刷新检查。',
-    operation_failed: '云端操作未确认，请刷新检查，勿重复提交。',
+    ambiguous_target: '存在重复会话记录，已拒绝操作。',
+    invalid_target: '目标标识无效，请刷新面板。',
+    pause_unconfirmed: '暂停未确认，请刷新检查。',
+    kill_unconfirmed: '销毁未确认，请刷新检查。',
+    operation_failed: '云端操作未确认，请刷新检查。',
   });
 
   const $ = (id) => document.getElementById(id);
@@ -53,6 +57,7 @@
     pollPill: $('poll-pill'),
     poll: $('poll-state'),
     themeToggle: $('theme-toggle'),
+    themeLabel: $('theme-label'),
     scopeBadge: $('scope-badge'),
     noticeBar: $('notice-bar'),
     notice: $('notice'),
@@ -60,17 +65,26 @@
     uptime: $('plugin-uptime'),
     lastUpdated: $('last-updated'),
     slotMatrix: $('slot-matrix'),
-    sessionsRegion: $('sessions-region'),
+    kpiRunningCard: $('kpi-running-card'),
+    kpiPausedCard: $('kpi-paused-card'),
+    kpiKeysCard: $('kpi-keys-card'),
+    tabSessions: $('tab-sessions'),
+    tabKeys: $('tab-keys'),
+    tabKeysDot: $('tab-keys-dot'),
+    panelSessions: $('tabpanel-sessions'),
+    panelKeys: $('tabpanel-keys'),
+    viewSwitchWrap: $('view-switch-wrap'),
     viewTableBtn: $('view-table-btn'),
     viewCardBtn: $('view-card-btn'),
+    sessionsRegion: $('sessions-region'),
     tableWrap: $('table-wrap'),
     list: $('session-list'),
     empty: $('session-empty'),
     emptyTitle: $('empty-title'),
-    emptyDesc: $('empty-desc'),
     resetFilters: $('reset-filters'),
     search: $('session-search'),
     filter: $('status-filter'),
+    statusPills: $('status-pills'),
     sort: $('session-sort'),
     pageSize: $('page-size'),
     previous: $('previous-page'),
@@ -79,7 +93,6 @@
     pageSummary: $('page-summary'),
     keys: $('key-list'),
     dialog: $('confirm-dialog'),
-    confirmEyebrow: $('confirm-eyebrow'),
     confirm: $('confirm-action'),
     cancel: $('cancel-action'),
     pauseAck: $('pause-ack'),
@@ -87,6 +100,9 @@
     fillKillId: $('fill-kill-id'),
     killMatchHint: $('kill-match-hint'),
     feedback: $('action-feedback'),
+    toast: $('toast'),
+    toastText: $('toast-text'),
+    toastClose: $('toast-close'),
   };
 
   let client = null;
@@ -97,13 +113,18 @@
   let tickTimer = null;
   let searchTimer = null;
   let readyTimer = null;
+  let toastTimer = null;
+  let resizeObserver = null;
   let unsubscribeContext = null;
   let lastFocusedElement = null;
   let readController = null;
   let readSequence = 0;
   let failures = 0;
   let pageIndex = 0;
+  let activeTab = 'sessions';
   let viewMode = 'table';
+  let themeMode = 'auto';
+  let hostIsDark = null;
   let pendingTarget = null;
   let actionBusy = false;
   let isLoading = false;
@@ -111,6 +132,7 @@
   let disposed = false;
 
   const keyCountdowns = [];
+  const keyCooldownPeaks = Object.create(null);
   const relativeTimeNodes = [];
   const lifespanNodes = [];
   const lastKpiValues = Object.create(null);
@@ -144,7 +166,7 @@
     return element('span', fallbackClass);
   }
 
-  /* 将生硬的 AstrBot 会话标识（如 aiocqhttp:GroupMessage:12345#user:888）解析为人类易读标题与渠道标签 */
+  /* 将 AstrBot 原始会话标识解析为易读来源与平台名称 */
   function parseSessionIdentity(rawLabel) {
     const raw = safeLabel(rawLabel, '');
     if (!raw) {
@@ -192,13 +214,15 @@
     const date = new Date(tsSeconds * 1000);
     if (Number.isNaN(date.getTime())) return fallback;
     const pad = (n) => String(n).padStart(2, '0');
-    const y = date.getFullYear();
-    const m = pad(date.getMonth() + 1);
-    const d = pad(date.getDate());
-    const hh = pad(date.getHours());
-    const mm = pad(date.getMinutes());
-    const ss = pad(date.getSeconds());
-    return `${y}-${m}-${d} ${hh}:${mm}:${ss}`;
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+  }
+
+  function formatClockTime(tsSeconds, fallback = '—') {
+    if (!isFiniteNum(tsSeconds) || tsSeconds <= 0) return fallback;
+    const date = new Date(tsSeconds * 1000);
+    if (Number.isNaN(date.getTime())) return fallback;
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
   }
 
   function formatCompactTime(tsSeconds, nowMs = Date.now(), fallback = '—') {
@@ -206,13 +230,12 @@
     const date = new Date(tsSeconds * 1000);
     if (Number.isNaN(date.getTime())) return fallback;
     const pad = (n) => String(n).padStart(2, '0');
-    const nowYear = new Date(nowMs).getFullYear();
     const y = date.getFullYear();
     const m = pad(date.getMonth() + 1);
     const d = pad(date.getDate());
     const hh = pad(date.getHours());
     const mm = pad(date.getMinutes());
-    return y !== nowYear ? `${y}-${m}-${d} ${hh}:${mm}` : `${m}-${d} ${hh}:${mm}`;
+    return y !== new Date(nowMs).getFullYear() ? `${y}-${m}-${d} ${hh}:${mm}` : `${m}-${d} ${hh}:${mm}`;
   }
 
   function formatRelativeTime(tsSeconds, nowMs, fallback = '—') {
@@ -220,10 +243,10 @@
     const diffSec = Math.floor((nowMs - tsSeconds * 1000) / 1000);
     if (!Number.isFinite(diffSec)) return fallback;
     if (diffSec < 5) return '刚刚活跃';
-    if (diffSec < 60) return `${diffSec} 秒前活跃`;
-    if (diffSec < 3600) return `${Math.floor(diffSec / 60)} 分钟前活跃`;
-    if (diffSec < 86400) return `${Math.floor(diffSec / 3600)} 小时前活跃`;
-    return `${Math.floor(diffSec / 86400)} 天前活跃`;
+    if (diffSec < 60) return `${diffSec} 秒前`;
+    if (diffSec < 3600) return `${Math.floor(diffSec / 60)} 分钟前`;
+    if (diffSec < 86400) return `${Math.floor(diffSec / 3600)} 小时前`;
+    return `${Math.floor(diffSec / 86400)} 天前`;
   }
 
   function formatDuration(seconds) {
@@ -233,8 +256,8 @@
     const hours = Math.floor((total % 86400) / 3600);
     const mins = Math.floor((total % 3600) / 60);
     const secs = total % 60;
-    if (days > 0) return `${days}天 ${String(hours).padStart(2, '0')}小时`;
-    if (hours > 0) return `${hours}小时 ${String(mins).padStart(2, '0')}分`;
+    if (days > 0) return `${days}天 ${String(hours).padStart(2, '0')}时`;
+    if (hours > 0) return `${hours}时 ${String(mins).padStart(2, '0')}分`;
     if (mins > 0) return `${mins}分 ${String(secs).padStart(2, '0')}秒`;
     return `${secs}秒`;
   }
@@ -243,22 +266,134 @@
     return isFiniteNum(value) ? `${value} ${unit}` : '—';
   }
 
+  /* 三态主题管理：跟随宿主（默认）/ 浅色 / 深色 */
+  function updateMetaColorScheme(content) {
+    if (!document.querySelector) return;
+    const meta = document.querySelector('meta[name="color-scheme"]');
+    if (meta && typeof meta.setAttribute === 'function') {
+      meta.setAttribute('content', content);
+    }
+  }
+
+  function applyThemeState() {
+    if (!document.documentElement) return;
+    document.documentElement.setAttribute('data-theme-mode', themeMode);
+    if (themeMode === 'auto') {
+      if (typeof hostIsDark === 'boolean') {
+        const resolved = hostIsDark ? 'dark' : 'light';
+        document.documentElement.setAttribute('data-theme', resolved);
+        updateMetaColorScheme(resolved);
+      } else {
+        updateMetaColorScheme('light dark');
+      }
+    } else {
+      document.documentElement.setAttribute('data-theme', themeMode);
+      updateMetaColorScheme(themeMode);
+    }
+    if (dom.themeLabel) {
+      text(dom.themeLabel, THEME_LABELS[themeMode] || '跟随宿主');
+    }
+    if (dom.themeToggle) {
+      const hostDesc = typeof hostIsDark === 'boolean' ? (hostIsDark ? '深色' : '浅色') : '自动';
+      const title = themeMode === 'auto'
+        ? `当前跟随宿主（${hostDesc}），点击切换浅色`
+        : themeMode === 'light'
+          ? '当前手动浅色，点击切换深色'
+          : '当前手动深色，点击恢复跟随宿主';
+      dom.themeToggle.setAttribute('title', title);
+      dom.themeToggle.setAttribute('aria-label', title);
+    }
+  }
+
+  function setThemeMode(nextMode) {
+    themeMode = THEME_MODES.includes(nextMode) ? nextMode : 'auto';
+    applyThemeState();
+  }
+
+  function applyContextTheme(context) {
+    if (context && typeof context.isDark === 'boolean') {
+      hostIsDark = context.isDark;
+      if (themeMode === 'auto') {
+        applyThemeState();
+      }
+    }
+  }
+
+  /* 轻提示（Snackbar）：弹窗打开时不打扰，聚焦关闭按钮时暂停消失 */
+  function hideToast() {
+    window.clearTimeout(toastTimer);
+    toastTimer = null;
+    if (dom.toast) dom.toast.hidden = true;
+  }
+
+  function showToast(message, kind = '') {
+    if (!dom.toast || !dom.toastText || disposed) return;
+    if (dom.dialog && dom.dialog.open) return;
+    window.clearTimeout(toastTimer);
+    text(dom.toastText, message);
+    dom.toast.className = kind ? `toast toast--${kind}` : 'toast';
+    dom.toast.hidden = false;
+    toastTimer = window.setTimeout(() => {
+      if (dom.toastClose && document.activeElement === dom.toastClose) {
+        return;
+      }
+      hideToast();
+    }, TOAST_MS);
+  }
+
+  /* 顶部错误横幅：仅在报错或桥接不可用时展开，正常状态隐藏保持极简 */
+  function setNotice(message, kind = '', showRetry = false) {
+    text(dom.notice, message);
+    if (dom.noticeBar) {
+      const isError = kind === 'error';
+      dom.noticeBar.className = isError ? 'alert-banner alert-banner--error' : 'alert-banner';
+      dom.noticeBar.hidden = !isError;
+    }
+    if (dom.retry) {
+      dom.retry.hidden = !showRetry;
+    }
+  }
+
   function setKpiValue(id, valueStr) {
     const node = $(id);
     if (!node) return;
     const prev = lastKpiValues[id];
     text(node, valueStr);
     if (prev !== undefined && prev !== valueStr) {
-      node.className = 'kpi-value mono is-updated';
+      node.className = 'overview-value mono is-updated';
       if (typeof window.requestAnimationFrame === 'function') {
         window.requestAnimationFrame(() => {
           window.setTimeout(() => {
-            if (!disposed) node.className = 'kpi-value mono';
-          }, 260);
+            if (!disposed) node.className = 'overview-value mono';
+          }, 240);
         });
       }
     }
     lastKpiValues[id] = valueStr;
+  }
+
+  /* 双 Tab 切换与无障碍键盘导航 */
+  function switchTab(nextTab, focusTab = false) {
+    activeTab = nextTab === 'keys' ? 'keys' : 'sessions';
+    const isSessions = activeTab === 'sessions';
+    if (dom.tabSessions) {
+      dom.tabSessions.setAttribute('aria-selected', isSessions ? 'true' : 'false');
+      dom.tabSessions.setAttribute('tabindex', isSessions ? '0' : '-1');
+      if (focusTab && isSessions && typeof dom.tabSessions.focus === 'function') dom.tabSessions.focus();
+    }
+    if (dom.tabKeys) {
+      dom.tabKeys.setAttribute('aria-selected', isSessions ? 'false' : 'true');
+      dom.tabKeys.setAttribute('tabindex', isSessions ? '-1' : '0');
+      if (focusTab && !isSessions && typeof dom.tabKeys.focus === 'function') dom.tabKeys.focus();
+    }
+    if (dom.panelSessions) dom.panelSessions.hidden = !isSessions;
+    if (dom.panelKeys) dom.panelKeys.hidden = isSessions;
+    if (dom.viewSwitchWrap) {
+      dom.viewSwitchWrap.hidden = !isSessions;
+      if (isSessions && dom.sessionsRegion && isFiniteNum(dom.sessionsRegion.clientWidth) && dom.sessionsRegion.clientWidth > 0) {
+        syncCompactSwitcher(dom.sessionsRegion.clientWidth);
+      }
+    }
   }
 
   function setViewMode(nextMode) {
@@ -278,18 +413,62 @@
     }
   }
 
-  function applyTheme(theme) {
-    if (!document.documentElement) return;
-    const next = theme === 'light' ? 'light' : 'dark';
-    document.documentElement.setAttribute('data-theme', next);
-    if (dom.themeToggle) {
-      dom.themeToggle.setAttribute('aria-pressed', next === 'light' ? 'true' : 'false');
+  function syncCompactSwitcher(width) {
+    if (!dom.viewSwitchWrap || activeTab !== 'sessions') return;
+    if (isFiniteNum(width) && width > 0) {
+      dom.viewSwitchWrap.hidden = width < COMPACT_CARD_WIDTH;
     }
   }
 
-  function applyContextTheme(context) {
-    if (context && typeof context.isDark === 'boolean') {
-      applyTheme(context.isDark ? 'dark' : 'light');
+  function syncStatusPills(filterValue) {
+    if (!dom.statusPills || !dom.statusPills.querySelectorAll) return;
+    const pills = dom.statusPills.querySelectorAll('.filter-pill');
+    for (let i = 0; i < pills.length; i += 1) {
+      const btn = pills[i];
+      const val = btn.getAttribute('data-filter');
+      const active = val === filterValue || (filterValue === 'starting' && val === 'pending') || (filterValue === 'unknown' && val === 'pending');
+      btn.className = active ? 'filter-pill is-active' : 'filter-pill';
+      btn.setAttribute('aria-pressed', active ? 'true' : 'false');
+    }
+  }
+
+  function setStatusFilter(value) {
+    if (dom.filter) dom.filter.value = value;
+    syncStatusPills(value);
+    pageIndex = 0;
+    renderSessions();
+  }
+
+  function copySandboxId(sandboxId) {
+    if (!sandboxId) return;
+    const nav = window.navigator;
+    if (nav && nav.clipboard && typeof nav.clipboard.writeText === 'function') {
+      nav.clipboard.writeText(sandboxId).then(
+        () => showToast('已复制沙箱 ID', 'success'),
+        () => fallbackCopyText(sandboxId),
+      );
+      return;
+    }
+    fallbackCopyText(sandboxId);
+  }
+
+  function fallbackCopyText(value) {
+    try {
+      if (!document.body || typeof document.execCommand !== 'function') {
+        showToast('当前环境不支持剪贴板复制');
+        return;
+      }
+      const area = document.createElement('textarea');
+      area.value = value;
+      area.setAttribute('readonly', '');
+      area.className = 'sr-only';
+      document.body.appendChild(area);
+      area.select();
+      const ok = document.execCommand('copy');
+      document.body.removeChild(area);
+      showToast(ok ? '已复制沙箱 ID' : '复制失败，请手动选中复制', ok ? 'success' : '');
+    } catch {
+      showToast('复制失败，请手动选中复制');
     }
   }
 
@@ -305,16 +484,6 @@
     lastFocusedElement = null;
   }
 
-  function setNotice(message, kind = '', showRetry = false) {
-    text(dom.notice, message);
-    if (dom.noticeBar) {
-      dom.noticeBar.className = kind ? `notice notice--${kind}` : 'notice';
-    }
-    if (dom.retry) {
-      dom.retry.hidden = !showRetry;
-    }
-  }
-
   function safeFailure(error) {
     if (window.E2BPanelBridge && error instanceof window.E2BPanelBridge.PanelClientError) {
       if (error.code && hasOwn(BLOCKED_LABELS, error.code)) {
@@ -322,7 +491,7 @@
       }
       return error.message;
     }
-    return '请求未完成，请检查登录状态并手动刷新。';
+    return '请求未完成，请检查登录状态后重试。';
   }
 
   function setLoadingState(loading) {
@@ -333,7 +502,7 @@
     if (dom.refreshIcon) {
       dom.refreshIcon.setAttribute('class', isLoading ? 'refresh-icon is-spinning' : 'refresh-icon');
     }
-    text(dom.refreshLabel || dom.refresh, isLoading ? '同步中…' : '刷新状态');
+    text(dom.refreshLabel || dom.refresh, isLoading ? '同步中…' : '刷新');
     updatePollLabel();
   }
 
@@ -343,46 +512,36 @@
   }
 
   function updatePollLabel() {
-    let label = '实时同步中';
-    let pillClass = 'poll-pill poll-pill--active';
-    let detail = '每 10 秒同步本地状态快照';
+    let label = '10s 自动同步';
+    let pillClass = 'sync-pill sync-pill--active';
     if (bridgeUnavailable) {
-      label = '桥接不可用';
-      pillClass = 'poll-pill poll-pill--error';
-      detail = '未连接到宿主页面桥接';
+      label = '未连接';
+      pillClass = 'sync-pill sync-pill--error';
     } else if (!client) {
-      label = '等待宿主桥接';
-      pillClass = 'poll-pill';
-      detail = '正在等待宿主页面就绪';
+      label = '连接中';
+      pillClass = 'sync-pill';
     } else if (isLoading) {
-      label = '读取中…';
-      pillClass = 'poll-pill poll-pill--active';
-      detail = '正在读取本地追踪快照';
+      label = '同步中…';
+      pillClass = 'sync-pill sync-pill--active';
     } else if (document.hidden) {
       label = '后台静默';
-      pillClass = 'poll-pill poll-pill--paused';
-      detail = '页面在后台，已暂停轮询';
+      pillClass = 'sync-pill sync-pill--paused';
     } else if (actionBusy) {
-      label = '执行管控中';
-      pillClass = 'poll-pill poll-pill--paused';
-      detail = '正在执行管理操作，已暂停轮询';
+      label = '执行中';
+      pillClass = 'sync-pill sync-pill--paused';
     } else if (dom.dialog && dom.dialog.open) {
       label = '等待确认';
-      pillClass = 'poll-pill poll-pill--paused';
-      detail = '等待二次确认，已暂停轮询';
+      pillClass = 'sync-pill sync-pill--paused';
     } else if (dom.auto && !dom.auto.checked) {
-      label = '手动刷新模式';
-      pillClass = 'poll-pill poll-pill--paused';
-      detail = '已关闭自动同步';
+      label = '已暂停同步';
+      pillClass = 'sync-pill sync-pill--paused';
     } else if (failures >= FAILURE_LIMIT) {
       label = '同步中断';
-      pillClass = 'poll-pill poll-pill--error';
-      detail = '连续刷新失败，已暂停自动轮询';
+      pillClass = 'sync-pill sync-pill--error';
     }
     text(dom.poll, label);
     if (dom.pollPill) {
       dom.pollPill.className = pillClass;
-      dom.pollPill.setAttribute('title', detail);
     }
   }
 
@@ -424,7 +583,7 @@
     return value;
   }
 
-  async function refresh(manual) {
+  async function refresh(manual, announce = false) {
     if (!client || disposed || document.hidden || actionBusy || (dom.dialog && dom.dialog.open)) return false;
     if (manual) failures = 0;
     stopPolling();
@@ -433,7 +592,6 @@
     const controller = new AbortController();
     readController = controller;
     setLoadingState(true);
-    setNotice('正在读取本地追踪状态（不连接或唤醒云沙箱，零额外计费）…', '', false);
     try {
       const result = validateSnapshot(await client.getSnapshot(controller.signal));
       if (disposed || sequence !== readSequence || controller.signal.aborted) return false;
@@ -444,7 +602,8 @@
         ? pluginInfo.uptime_seconds : null;
       failures = 0;
       renderSnapshot();
-      setNotice('状态已更新。休眠中的沙箱不产生云端计费；管理操作均需二次确认。', 'success', false);
+      setNotice('', '', false);
+      if (announce) showToast('状态已更新', 'success');
       return true;
     } catch (error) {
       if (disposed || sequence !== readSequence || (error && error.name === 'AbortError')) return false;
@@ -482,38 +641,40 @@
     const pluginInfo = snapshot.plugin && typeof snapshot.plugin === 'object' ? snapshot.plugin : {};
     text(dom.version, typeof pluginInfo.version === 'string' && pluginInfo.version.trim()
       ? `v${pluginInfo.version.trim()}` : 'v—');
-    text(dom.lastUpdated, formatLocalTime(snapshot.generated_at, '—'));
+    const updatedNode = dom.lastUpdated;
+    text(updatedNode, formatClockTime(snapshot.generated_at, '—'));
+    if (updatedNode && isFiniteNum(snapshot.generated_at)) {
+      updatedNode.setAttribute('title', formatLocalTime(snapshot.generated_at));
+    }
 
     const counts = snapshot.counts;
     const cap = snapshot.capacity;
 
     if (dom.scopeBadge) {
       const isolated = cap.sandbox_scope === 'group_member';
-      dom.scopeBadge.className = isolated ? 'scope-pill scope-pill--isolated' : 'scope-pill';
-      text(dom.scopeBadge, isolated ? '群聊按成员独立隔离' : '群聊共享协作模式');
-    }
-
-    // 更新生命周期流转全景条实时数字与阈值说明
-    text($('flow-queue-badge'), `${displayNumber(cap.waiting)} 排队`);
-    text($('flow-running-badge'), `${displayNumber(counts.running)} 运行`);
-    text($('flow-paused-badge'), `${displayNumber(counts.paused)} 休眠`);
-    if (isFiniteNum(cap.idle_pause_seconds)) {
-      text($('flow-idle-desc'), `执行完默认立即休眠；保持运行空闲满 ${cap.idle_pause_seconds} 秒自动休眠`);
-    }
-    if (isFiniteNum(cap.paused_retention_hours)) {
-      text($('flow-retention-desc'), `休眠满 ${cap.paused_retention_hours} 小时后台自动销毁释放，重要产物请及时发回`);
+      dom.scopeBadge.className = isolated ? 'chip chip--running' : 'chip chip--neutral';
+      text(dom.scopeBadge, isolated ? '群聊按成员独立隔离' : '群聊共享');
     }
 
     setKpiValue('count-running', displayNumber(counts.running));
     const busyCount = isFiniteNum(counts.busy) && counts.busy > 0 ? counts.busy : 0;
-    text($('running-sub'), busyCount > 0 ? `正在执行代码 · ${busyCount} 台忙碌中` : '占用并发运行槽位');
+    text($('running-sub'), busyCount > 0 ? `${busyCount} 台执行中` : '占用运行槽位');
+
     setKpiValue('count-paused', displayNumber(counts.paused));
-    setKpiValue('count-unknown', displayNumber(counts.unknown));
-    setKpiValue('capacity-waiting', displayNumber(cap.waiting));
+    text($('paused-sub'), isFiniteNum(cap.paused_retention_hours)
+      ? `最长保留 ${cap.paused_retention_hours} 小时`
+      : '保留状态');
+
+    text($('count-unknown'), displayNumber(counts.unknown));
     text($('count-total'), displayNumber(counts.total));
+    text($('pill-count-all'), displayNumber(counts.total));
+    text($('pill-count-running'), displayNumber(counts.running));
+    text($('pill-count-paused'), displayNumber(counts.paused));
+    text($('pill-count-busy'), displayNumber(busyCount));
 
     setKpiValue('capacity-used', displayNumber(cap.occupied));
     text($('capacity-limit'), displayNumber(cap.limit));
+    text($('capacity-waiting'), displayNumber(cap.waiting));
 
     const validOccupied = isFiniteNum(cap.occupied);
     const validLimit = isFiniteNum(cap.limit) && cap.limit > 0;
@@ -521,7 +682,11 @@
       ? `${Math.min(100, Math.max(0, Math.round((cap.occupied / cap.limit) * 100)))}%`
       : '—';
     text($('capacity-percent'), percentText);
-    text($('capacity-brief'), `空闲 ${displayNumber(cap.available)} · 排队 ${displayNumber(cap.waiting)}`);
+
+    const unknownCount = isFiniteNum(counts.unknown) && counts.unknown > 0 ? counts.unknown : 0;
+    const briefParts = [`空闲 ${displayNumber(cap.available)}`, `排队 ${displayNumber(cap.waiting)}`];
+    if (unknownCount > 0) briefParts.push(`待确认 ${unknownCount}`);
+    text($('capacity-brief'), briefParts.join(' · '));
     renderSlotMatrix(cap.limit, counts.running, cap.occupied);
 
     const progress = $('capacity-progress');
@@ -542,16 +707,16 @@
     text($('policy-return-limit'), formatUnit(cap.return_file_limit_mb, 'MB'));
 
     const pendingBanner = $('capacity-pending');
+    const limitMismatch = isFiniteNum(cap.runtime_limit) && isFiniteNum(cap.limit) && cap.runtime_limit !== cap.limit;
     if (pendingBanner) {
-      const mismatch = isFiniteNum(cap.runtime_limit) && isFiniteNum(cap.limit) && cap.runtime_limit !== cap.limit;
-      pendingBanner.hidden = !mismatch;
-      if (mismatch) {
-        text(pendingBanner, `生效上限 ${cap.runtime_limit}（配置 ${cap.limit}）`);
+      pendingBanner.hidden = !limitMismatch;
+      if (limitMismatch) {
+        text(pendingBanner, `生效 ${cap.runtime_limit} / 配置 ${cap.limit}`);
       }
     }
 
     renderSessions();
-    renderKeys();
+    renderKeys(limitMismatch);
     startTicker();
   }
 
@@ -565,9 +730,11 @@
     const parsed = parseSessionIdentity(labelText);
     const sandboxText = typeof session.sandbox_id === 'string' ? session.sandbox_id : '';
     const aliasText = typeof session.key_alias === 'string' ? session.key_alias : '';
-    const haystack = `${labelText}\n${parsed.title}\n${parsed.platform}\n${sandboxText}\n${aliasText}`.toLocaleLowerCase('zh-CN');
+    const keyText = typeof session.key_label === 'string' ? session.key_label : '';
+    const haystack = `${labelText}\n${parsed.title}\n${parsed.platform}\n${sandboxText}\n${keyText}\n${aliasText}`.toLocaleLowerCase('zh-CN');
     if (query && !haystack.includes(query)) return false;
     if (filter === 'busy') return session.busy === true;
+    if (filter === 'pending') return session.status !== 'running' && session.status !== 'paused';
     if (filter === 'starting') return session.status === 'starting';
     if (filter === 'unknown') return session.status !== 'running' && session.status !== 'paused' && session.status !== 'starting';
     return filter === 'all' || session.status === filter;
@@ -626,18 +793,17 @@
       dom.empty.hidden = hasRows;
       if (!hasRows) {
         const hasFilters = Boolean(query || filter !== 'all');
-        text(dom.emptyTitle, hasFilters ? '没有符合筛选条件的沙箱会话' : '还没有活跃或休眠的云沙箱');
-        text(dom.emptyDesc, hasFilters
-          ? '可以尝试清空搜索词，或将状态筛选切回「全部状态」。'
-          : '当用户在对话中让机器人执行 Python 计算、处理表格或绘制图表时，云沙箱会自动出现在这里。');
+        text(dom.emptyTitle, hasFilters ? '没有匹配的云沙箱实例' : '暂无云沙箱实例');
         if (dom.resetFilters) dom.resetFilters.hidden = !hasFilters;
       }
     }
 
-    text($('session-summary'), `匹配 ${sorted.length} / 共 ${allSessions.length} 台`);
+    text($('session-summary'), sorted.length === allSessions.length
+      ? `共 ${allSessions.length} 台`
+      : `匹配 ${sorted.length} / ${allSessions.length} 台`);
     const rangeStart = sorted.length ? start + 1 : 0;
     const rangeEnd = start + visible.length;
-    text(dom.pageSummary, sorted.length ? `当前展示第 ${rangeStart}–${rangeEnd} 台（共 ${sorted.length} 台）` : '共 0 台');
+    text(dom.pageSummary, sorted.length ? `${rangeStart}–${rangeEnd}` : '');
     text(dom.page, `${pageIndex + 1} / ${pageCount}`);
     if (dom.previous) dom.previous.disabled = pageIndex === 0;
     if (dom.next) dom.next.disabled = pageIndex >= pageCount - 1;
@@ -647,7 +813,7 @@
   function sessionRow(session, retentionSeconds) {
     const tr = element('tr', 'session-row');
 
-    // 第 1 列：形象化对话来源（群聊/私聊图标 + 渠道徽章 + 易读名称）与沙箱 ID
+    // 列 1：来源与沙箱 ID（带一键复制按钮）
     const tdIdentity = element('td', 'col-identity');
     const idBox = element('div', 'cell-identity');
     const parsed = parseSessionIdentity(session.session_label);
@@ -659,7 +825,7 @@
     const idStack = element('div', 'identity-stack');
     const headline = element('div', 'identity-headline');
     const labelNode = element('span', 'session-label', parsed.title);
-    if (parsed.raw) labelNode.setAttribute('title', `原始会话标识: ${parsed.raw}`);
+    if (parsed.raw) labelNode.setAttribute('title', parsed.raw);
     headline.appendChild(labelNode);
     if (parsed.platform) {
       headline.appendChild(element('span', 'platform-tag', parsed.platform));
@@ -667,65 +833,77 @@
     idStack.appendChild(headline);
 
     const rawSandbox = typeof session.sandbox_id === 'string' ? session.sandbox_id.trim() : '';
-    const sandboxText = rawSandbox || (typeof session.sandbox_id === 'string' ? '云端 ID 待确认' : '—');
+    const sandboxText = rawSandbox || (typeof session.sandbox_id === 'string' ? 'ID 待确认' : '—');
     const sandboxLine = element('div', 'sandbox-line');
-    sandboxLine.appendChild(cloneIcon('tpl-icon-vm'));
     const sandboxNode = element('span', 'sandbox-id mono', sandboxText);
-    if (rawSandbox) sandboxNode.setAttribute('title', `云沙箱 ID: ${rawSandbox}`);
+    if (rawSandbox) sandboxNode.setAttribute('title', rawSandbox);
     sandboxLine.appendChild(sandboxNode);
+    if (rawSandbox) {
+      const copyBtn = element('button', 'copy-id-btn');
+      copyBtn.type = 'button';
+      copyBtn.setAttribute('aria-label', '复制沙箱 ID');
+      copyBtn.setAttribute('title', '复制沙箱 ID');
+      copyBtn.appendChild(cloneIcon('tpl-icon-copy'));
+      copyBtn.addEventListener('click', () => copySandboxId(rawSandbox));
+      sandboxLine.appendChild(copyBtn);
+    }
     idStack.appendChild(sandboxLine);
 
     idBox.appendChild(idStack);
     tdIdentity.appendChild(idBox);
     tr.appendChild(tdIdentity);
 
-    // 第 2 列：状态胶囊
+    // 列 2：运行状态
     const tdStatus = element('td', 'col-status');
     const statusWrap = element('div', 'cell-status');
     const status = typeof session.status === 'string' && hasOwn(STATUS_LABELS, session.status)
       ? session.status : 'unknown';
-    const badge = element('span', `badge badge--${status}`);
+    const chipClass = status === 'running' ? 'chip chip--running'
+      : status === 'paused' ? 'chip chip--paused'
+        : status === 'starting' ? 'chip chip--primary'
+          : 'chip chip--neutral';
+    const badge = element('span', chipClass);
     badge.appendChild(element('i', `dot dot--${status}`));
     badge.appendChild(element('span', '', STATUS_LABELS[status]));
     statusWrap.appendChild(badge);
     if (session.busy === true) {
-      statusWrap.appendChild(element('span', 'badge badge--busy', '执行中'));
+      statusWrap.appendChild(element('span', 'chip chip--primary', '执行中'));
     }
     if (session.owner_known === false) {
-      statusWrap.appendChild(element('span', 'badge badge--danger', 'Key 缺失'));
+      statusWrap.appendChild(element('span', 'chip chip--danger', 'Key 缺失'));
     }
     tdStatus.appendChild(statusWrap);
     tr.appendChild(tdStatus);
 
-    // 第 3 列：绑定 API Key（含备注名）与环境模板
+    // 列 3：绑定 Key 与模板
     const tdKey = element('td', 'col-key');
     const keyStack = element('div', 'cell-meta-stack');
     const keyDisplay = formatKeyDisplay(session.key_label, session.key_alias);
-    const keyNode = element('span', 'cell-primary cell-key-name', keyDisplay);
+    const keyNode = element('span', 'cell-primary', keyDisplay);
     if (keyDisplay !== '—') keyNode.setAttribute('title', keyDisplay);
     keyStack.appendChild(keyNode);
     const rawTemplate = typeof session.template === 'string' ? session.template.trim() : '';
-    const tplText = rawTemplate ? `模板 ${rawTemplate}` : '官方默认环境';
-    const tplNode = element('span', 'cell-secondary cell-template mono', tplText);
-    if (rawTemplate) tplNode.setAttribute('title', `自定义模板 ID: ${rawTemplate}`);
+    const tplText = rawTemplate || '默认环境';
+    const tplNode = element('span', 'cell-secondary mono', tplText);
+    if (rawTemplate) tplNode.setAttribute('title', rawTemplate);
     keyStack.appendChild(tplNode);
     tdKey.appendChild(keyStack);
     tr.appendChild(tdKey);
 
-    // 第 4 列：活跃度、创建时间与动态保留寿命进度条
+    // 列 4：活跃度与休眠寿命
     const nowMs = Date.now();
     const tdTime = element('td', 'col-time');
     const timeStack = element('div', 'cell-meta-stack');
-    const activeRel = element('span', 'cell-primary cell-time-primary mono', formatRelativeTime(session.last_active, nowMs));
+    const activeRel = element('span', 'cell-primary mono', formatRelativeTime(session.last_active, nowMs));
     const activeExact = formatLocalTime(session.last_active);
-    if (activeExact !== '—') activeRel.setAttribute('title', `最后活动时间: ${activeExact}`);
+    if (activeExact !== '—') activeRel.setAttribute('title', `最后活跃 ${activeExact}`);
     relativeTimeNodes.push({node: activeRel, ts: session.last_active});
     timeStack.appendChild(activeRel);
 
     const createdCompact = formatCompactTime(session.created_at, nowMs);
     const createdExact = formatLocalTime(session.created_at);
-    const createdNode = element('span', 'cell-secondary cell-time-secondary mono', `创建于 ${createdCompact}`);
-    if (createdExact !== '—') createdNode.setAttribute('title', `创建时间: ${createdExact}`);
+    const createdNode = element('span', 'cell-secondary mono', `创建 ${createdCompact}`);
+    if (createdExact !== '—') createdNode.setAttribute('title', `创建于 ${createdExact}`);
     timeStack.appendChild(createdNode);
 
     if (status === 'paused' && isFiniteNum(session.paused_at) && session.paused_at > 0 && retentionSeconds > 0) {
@@ -737,7 +915,7 @@
       lifeBox.appendChild(lifeLabel);
       lifeBox.appendChild(lifeTrack);
       const pausedExact = formatLocalTime(session.paused_at);
-      if (pausedExact !== '—') lifeBox.setAttribute('title', `休眠开始于: ${pausedExact}`);
+      if (pausedExact !== '—') lifeBox.setAttribute('title', `休眠于 ${pausedExact}`);
       lifespanNodes.push({
         label: lifeLabel,
         fill: lifeFill,
@@ -749,33 +927,38 @@
     tdTime.appendChild(timeStack);
     tr.appendChild(tdTime);
 
-    // 第 5 列：语义化传入附件 / 产出文件胶囊
+    // 列 5：文件往来（分别校验 pending_files 与 uploaded_files，避免缺失时错误归零或显示 —）
     const tdFiles = element('td', 'col-files');
     const filesWrap = element('div', 'cell-files mono');
-    const inCount = (isFiniteNum(session.pending_files) ? session.pending_files : 0)
-      + (isFiniteNum(session.uploaded_files) ? session.uploaded_files : 0);
+    const hasPending = isFiniteNum(session.pending_files);
+    const hasUploaded = isFiniteNum(session.uploaded_files);
+    const pendingCount = hasPending ? session.pending_files : 0;
+    const uploadedCount = hasUploaded ? session.uploaded_files : 0;
     const outCount = isFiniteNum(session.generated_files) ? session.generated_files : 0;
 
+    let inLabel = '↑ 附件 —';
+    if (hasPending || hasUploaded) {
+      inLabel = pendingCount > 0 ? `↑ 入箱 ${uploadedCount} (+${pendingCount})` : `↑ 入箱 ${uploadedCount}`;
+    }
     const inPill = element(
       'span',
-      inCount > 0 ? 'file-pill file-pill--in-active' : 'file-pill',
-      `↑ 附件 ${isFiniteNum(session.pending_files) ? inCount : '—'}`
+      (pendingCount + uploadedCount) > 0 ? 'file-pill file-pill--in-active' : 'file-pill',
+      inLabel,
     );
-    inPill.setAttribute('title', `待传缓存附件 ${displayNumber(session.pending_files)} · 已入沙箱文件 ${displayNumber(session.uploaded_files)}`);
+    inPill.setAttribute('title', `已入箱 ${displayNumber(session.uploaded_files)} · 待传 ${displayNumber(session.pending_files)}`);
 
     const outPill = element(
       'span',
       outCount > 0 ? 'file-pill file-pill--out-active' : 'file-pill',
-      `↓ 产物 ${displayNumber(session.generated_files)}`
+      `↓ 产物 ${displayNumber(session.generated_files)}`,
     );
-    outPill.setAttribute('title', '最近一次代码执行生成并缓存在本地可供发送的文件数');
 
     filesWrap.appendChild(inPill);
     filesWrap.appendChild(outPill);
     tdFiles.appendChild(filesWrap);
     tr.appendChild(tdFiles);
 
-    // 第 6 列：暂停与销毁管理按钮（保持契约结构：actionBox 首个子元素为 .action-row）
+    // 列 6：休眠与销毁（保持契约结构：actionBox 首子节点为 .action-row，含 [pauseBtn, killBtn]）
     const tdActions = element('td', 'col-actions');
     const actionBox = element('div', 'cell-actions');
     const actionRow = element('div', 'action-row');
@@ -783,17 +966,15 @@
     const canPause = session.can_pause === true && !ownerMissing;
     const canKill = session.can_kill === true && !ownerMissing;
 
-    const pauseBtn = element('button', 'btn btn--ghost btn--sm', '休眠');
+    const pauseBtn = element('button', 'btn btn--tonal btn--sm', '休眠');
     pauseBtn.type = 'button';
     pauseBtn.disabled = !canPause || actionBusy;
-    pauseBtn.setAttribute('title', '暂停此云沙箱以释放并发槽位并停止计费');
     pauseBtn.addEventListener('click', () => openConfirmation(session, 'pause'));
     actionRow.appendChild(pauseBtn);
 
-    const killBtn = element('button', 'btn btn--danger-ghost btn--sm', '销毁');
+    const killBtn = element('button', 'btn btn--tonal-danger btn--sm', '销毁');
     killBtn.type = 'button';
     killBtn.disabled = !canKill || actionBusy;
-    killBtn.setAttribute('title', '永久销毁此云沙箱并清除其变量与未保存文件');
     killBtn.addEventListener('click', () => openConfirmation(session, 'kill'));
     actionRow.appendChild(killBtn);
 
@@ -815,16 +996,50 @@
     return tr;
   }
 
-  function renderKeys() {
+  function renderKeys(limitMismatch = false) {
     keyCountdowns.length = 0;
     const validKeys = snapshot.keys.filter((key) => key && typeof key === 'object');
     const availableCount = validKeys.filter((key) => key.available !== false && number(key.cooldown_seconds) <= 0).length;
-    text($('key-count'), validKeys.length ? `${availableCount} / ${validKeys.length} 可轮询` : '0 把');
+    const cooldownCount = validKeys.filter((key) => isFiniteNum(key.cooldown_seconds) && key.cooldown_seconds > 0).length;
 
+    text($('key-count'), validKeys.length ? `${availableCount} / ${validKeys.length} 可用` : '0 把');
+    text($('kpi-keys-available'), displayNumber(availableCount));
+    text($('kpi-keys-total'), displayNumber(validKeys.length));
+
+    const kpiStatus = $('kpi-keys-status');
+    if (kpiStatus) {
+      if (!validKeys.length) {
+        kpiStatus.className = 'chip chip--neutral';
+        text(kpiStatus, '未配置');
+      } else if (cooldownCount > 0) {
+        kpiStatus.className = 'chip chip--paused';
+        text(kpiStatus, `${cooldownCount} 冷却中`);
+      } else {
+        kpiStatus.className = 'chip chip--running';
+        text(kpiStatus, '全部可用');
+      }
+    }
+    if (dom.tabKeysDot) {
+      dom.tabKeysDot.hidden = cooldownCount === 0 && !limitMismatch;
+    }
+
+    const activeLabels = new Set();
     const fragment = document.createDocumentFragment();
     validKeys.forEach((key) => {
+      const label = safeLabel(key.label);
+      activeLabels.add(label);
       const validCooldown = isFiniteNum(key.cooldown_seconds);
       const initialRemaining = number(key.cooldown_seconds);
+
+      // 记忆本次冷却周期峰值，避免每次 10 秒刷新将进度条重置回 100%
+      if (validCooldown && initialRemaining > 0) {
+        const defaultPeak = initialRemaining > 60 ? 300 : 60;
+        const prevPeak = keyCooldownPeaks[label] || 0;
+        keyCooldownPeaks[label] = Math.max(prevPeak, defaultPeak, initialRemaining);
+      } else {
+        delete keyCooldownPeaks[label];
+      }
+
       const item = element('div', initialRemaining > 0 ? 'key-item key-item--cooldown' : 'key-item key-item--ready');
 
       const top = element('div', 'key-item-top');
@@ -832,20 +1047,20 @@
       const iconWrap = element('span', 'key-icon');
       iconWrap.appendChild(cloneIcon('tpl-icon-key'));
       titleWrap.appendChild(iconWrap);
-      titleWrap.appendChild(element('span', 'key-name', safeLabel(key.label)));
+      titleWrap.appendChild(element('span', 'key-name', label));
       if (typeof key.alias === 'string' && key.alias.trim()) {
         const aliasBadge = element('span', 'key-alias', key.alias.trim());
-        aliasBadge.setAttribute('title', `配置备注: ${key.alias.trim()}`);
+        aliasBadge.setAttribute('title', key.alias.trim());
         titleWrap.appendChild(aliasBadge);
       }
       top.appendChild(titleWrap);
 
-      const stateBadge = element('span', 'badge');
+      const stateBadge = element('span', 'chip chip--neutral');
       top.appendChild(stateBadge);
       item.appendChild(top);
 
       const bottom = element('div', 'key-item-bottom');
-      bottom.appendChild(element('span', '', `已绑定沙箱 ${displayNumber(key.bound_sessions)} 台`));
+      bottom.appendChild(element('span', '', `绑定 ${displayNumber(key.bound_sessions)} 台`));
       const countdown = element('span', 'mono');
       bottom.appendChild(countdown);
       item.appendChild(bottom);
@@ -864,15 +1079,19 @@
         countdown,
         fill: cooldownFill,
         valid: validCooldown,
-        initialTotal: Math.max(60, initialRemaining),
+        initialTotal: keyCooldownPeaks[label] || Math.max(60, initialRemaining),
         remaining: initialRemaining,
         availableFlag: key.available !== false,
       });
       fragment.appendChild(item);
     });
 
+    Object.keys(keyCooldownPeaks).forEach((k) => {
+      if (!activeLabels.has(k)) delete keyCooldownPeaks[k];
+    });
+
     if (!validKeys.length) {
-      fragment.appendChild(element('p', 'muted small', '尚未配置任何 E2B API Key，请前往插件配置页填写。'));
+      fragment.appendChild(element('p', 'muted small', '未配置 API Key'));
     }
     if (dom.keys) dom.keys.replaceChildren(fragment);
     updateDynamicTicks();
@@ -893,15 +1112,15 @@
       if (remainSec <= 0) {
         item.label.className = 'lifespan-label lifespan-label--warn mono';
         item.fill.className = 'lifespan-fill lifespan-fill--warn';
-        text(item.label, '已到期 · 等待后台回收');
+        text(item.label, '待回收');
       } else if (remainSec < 3600) {
         item.label.className = 'lifespan-label lifespan-label--warn mono';
         item.fill.className = 'lifespan-fill lifespan-fill--warn';
-        text(item.label, `即将回收 · 剩 ${formatDuration(remainSec)}`);
+        text(item.label, `剩 ${formatDuration(remainSec)}`);
       } else {
         item.label.className = 'lifespan-label mono';
         item.fill.className = 'lifespan-fill';
-        text(item.label, `保留剩余 ${formatDuration(remainSec)}`);
+        text(item.label, `剩 ${formatDuration(remainSec)}`);
       }
     });
   }
@@ -918,8 +1137,8 @@
 
     keyCountdowns.forEach((item) => {
       if (!item.valid) {
-        item.badge.className = 'badge badge--unknown';
-        text(item.badge, item.availableFlag ? '状态未知' : '不可用');
+        item.badge.className = 'chip chip--neutral';
+        text(item.badge, item.availableFlag ? '未知' : '不可用');
         item.countdown.className = 'mono key-unavailable';
         text(item.countdown, '—');
         return;
@@ -927,35 +1146,35 @@
       const remaining = Math.max(0, Math.ceil(item.remaining - elapsedSec));
       if (remaining > 0) {
         item.card.className = 'key-item key-item--cooldown';
-        item.badge.className = 'badge badge--paused';
-        text(item.badge, '冷却保护中');
+        item.badge.className = 'chip chip--paused';
+        text(item.badge, '冷却中');
         item.countdown.className = 'mono key-cooldown';
-        const mm = Math.floor(remaining / 60);
+        const mm = String(Math.floor(remaining / 60)).padStart(2, '0');
         const ss = String(remaining % 60).padStart(2, '0');
-        text(item.countdown, `冷却剩余 ${mm}:${ss}`);
+        text(item.countdown, `剩余 ${mm}:${ss}`);
         if (item.fill && item.fill.style) {
           const pct = Math.max(0, Math.min(100, Math.round((remaining / item.initialTotal) * 100)));
           item.fill.style.width = `${pct}%`;
         }
       } else if (item.remaining > 0) {
         item.card.className = 'key-item';
-        item.badge.className = 'badge badge--unknown';
+        item.badge.className = 'chip chip--neutral';
         text(item.badge, '待刷新');
         item.countdown.className = 'mono';
-        text(item.countdown, '冷却结束 · 刷新确认');
+        text(item.countdown, '冷却结束');
         if (item.fill && item.fill.style) item.fill.style.width = '0%';
       } else if (!item.availableFlag) {
         item.card.className = 'key-item';
-        item.badge.className = 'badge badge--unknown';
+        item.badge.className = 'chip chip--neutral';
         text(item.badge, '不可用');
         item.countdown.className = 'mono key-unavailable';
-        text(item.countdown, '暂不可分配');
+        text(item.countdown, '不可分配');
       } else {
         item.card.className = 'key-item key-item--ready';
-        item.badge.className = 'badge badge--running';
+        item.badge.className = 'chip chip--running';
         text(item.badge, '可轮询');
         item.countdown.className = 'mono key-ready';
-        text(item.countdown, '参与新沙箱分配');
+        text(item.countdown, '正常');
       }
     });
 
@@ -985,11 +1204,12 @@
       return;
     }
     if (!dom.dialog || typeof dom.dialog.showModal !== 'function') {
-      setNotice('当前浏览器不支持原生安全确认对话框，管理操作已禁用。', 'error', false);
+      setNotice('当前浏览器不支持原生确认框，已禁用管理操作。', 'error', false);
       invalidateActions();
       return;
     }
 
+    hideToast();
     stopPolling();
     cancelRead();
     lastFocusedElement = document.activeElement instanceof HTMLElement ? document.activeElement : null;
@@ -998,14 +1218,10 @@
     const parsed = parseSessionIdentity(session.session_label);
     const displayOrigin = parsed.platform ? `${parsed.title}（${parsed.platform}）` : parsed.title;
 
-    if (dom.confirmEyebrow) {
-      dom.confirmEyebrow.className = action === 'kill' ? 'dialog-eyebrow dialog-eyebrow--danger' : 'dialog-eyebrow';
-      text(dom.confirmEyebrow, action === 'kill' ? '高危不可逆操作确认' : '实例休眠二次确认');
-    }
-    text($('confirm-title'), action === 'kill' ? '永久销毁此云沙箱？' : '休眠暂停此云沙箱？');
+    text($('confirm-title'), action === 'kill' ? '永久销毁此云沙箱？' : '休眠此云沙箱？');
     text($('confirm-description'), action === 'kill'
-      ? '销毁后不可恢复：该云沙箱内的内存变量、进程与未发回聊天窗口的文件将被彻底清除。'
-      : '暂停后将立即停止云端计费并释放并发槽位；沙箱内变量与文件会保留至休眠到期。');
+      ? '销毁后无法恢复，沙箱内变量与未发回文件将被清除。'
+      : '暂停后立即停止计费并释放运行槽位，状态与文件保留至休眠到期。');
     text($('confirm-session'), displayOrigin);
     text($('confirm-sandbox'), safeLabel(session.sandbox_id));
     text($('confirm-key'), formatKeyDisplay(session.key_label, session.key_alias));
@@ -1019,17 +1235,17 @@
     if (dom.killId) dom.killId.value = '';
     if (dom.feedback) dom.feedback.textContent = '';
 
-    dom.confirm.className = action === 'kill' ? 'btn btn--danger' : 'btn btn--primary';
-    text(dom.confirm, action === 'kill' ? '确认永久销毁' : '确认暂停沙箱');
+    dom.confirm.className = action === 'kill' ? 'btn btn--flat-danger btn--pill' : 'btn btn--flat btn--pill';
+    text(dom.confirm, action === 'kill' ? '永久销毁' : '确认暂停');
     dom.confirm.disabled = true;
     dom.cancel.disabled = false;
     updateConfirmation();
 
     dom.dialog.showModal();
     updatePollLabel();
-    if (action === 'kill' && dom.cancel) {
-      // 遵循破坏性弹窗焦点规范：初始焦点落在安全的取消按钮或核对框，防止连按回车误删
-      dom.killId ? dom.killId.focus() : dom.cancel.focus();
+    if (action === 'kill') {
+      if (dom.killId) dom.killId.focus();
+      else if (dom.cancel) dom.cancel.focus();
     } else if (dom.pauseAck) {
       dom.pauseAck.focus();
     }
@@ -1044,16 +1260,16 @@
       if (dom.killMatchHint) {
         if (!typed) {
           dom.killMatchHint.className = 'kill-match-hint mono';
-          text(dom.killMatchHint, `需完整匹配 ${expected.length} 个字符`);
+          text(dom.killMatchHint, '');
         } else if (typed === expected) {
           dom.killMatchHint.className = 'kill-match-hint kill-match-hint--ok mono';
-          text(dom.killMatchHint, '✓ 沙箱 ID 核对一致，可执行销毁');
+          text(dom.killMatchHint, '✓ ID 一致');
         } else if (expected.startsWith(typed)) {
           dom.killMatchHint.className = 'kill-match-hint mono';
-          text(dom.killMatchHint, `已匹配 ${typed.length} / ${expected.length} 个字符…`);
+          text(dom.killMatchHint, `${typed.length} / ${expected.length}`);
         } else {
           dom.killMatchHint.className = 'kill-match-hint kill-match-hint--mismatch mono';
-          text(dom.killMatchHint, '✕ 输入内容与目标沙箱 ID 不一致');
+          text(dom.killMatchHint, '✕ ID 不一致');
         }
       }
     } else {
@@ -1086,8 +1302,8 @@
     if (dom.fillKillId) dom.fillKillId.disabled = true;
     if (dom.pauseAck) dom.pauseAck.disabled = true;
 
-    text(dom.confirm, '正在提交…');
-    text(dom.feedback, '正在校验目标乐观版本锁并请求宿主执行，请勿重复提交。');
+    text(dom.confirm, '执行中…');
+    text(dom.feedback, '正在提交，请勿重复操作…');
     renderSessions();
     updatePollLabel();
 
@@ -1107,10 +1323,10 @@
       }
       success = true;
       message = result.outcome === 'killed'
-        ? '云沙箱已永久销毁。'
+        ? '云沙箱已销毁'
         : result.outcome === 'paused'
-          ? '云沙箱已休眠暂停。'
-          : '云端目标已不存在，本地追踪记录已自动清理。';
+          ? '云沙箱已休眠'
+          : '目标已不存在，记录已清理';
     } catch (error) {
       message = safeFailure(error);
     } finally {
@@ -1121,22 +1337,21 @@
       if (dom.pauseAck) dom.pauseAck.disabled = false;
       dom.cancel.disabled = false;
       if (dom.refresh) dom.refresh.disabled = false;
-      text(dom.confirm, action === 'kill' ? '确认永久销毁' : '确认暂停沙箱');
+      text(dom.confirm, action === 'kill' ? '永久销毁' : '确认暂停');
       if (dom.dialog && dom.dialog.open && typeof dom.dialog.close === 'function') {
         dom.dialog.close();
         dom.dialog.returnValue = '';
       }
       if (!disposed) {
         invalidateActions();
-        setNotice(`${message} 正在同步最新状态…`, success ? 'success' : 'error', !success);
         restoreFocus();
-        if (!document.hidden) {
-          const refreshed = await refresh(true);
-          if (!disposed && refreshed) {
-            setNotice(`${message} 已同步最新状态。`, success ? 'success' : 'error', !success);
-          }
+        if (success) {
+          showToast(message, 'success');
         } else {
-          setNotice(`${message} 返回前台后将自动刷新。`, success ? 'success' : 'error', !success);
+          setNotice(message, 'error', true);
+        }
+        if (!document.hidden) {
+          await refresh(true, false);
         }
         schedulePoll();
       }
@@ -1144,9 +1359,10 @@
   }
 
   async function initialize() {
+    applyThemeState();
     const sdk = window.AstrBotPluginView || window.AstrBotPluginPage;
     if (!sdk || typeof sdk.ready !== 'function' || !window.E2BPanelBridge || window.parent === window) {
-      setNotice('当前宿主不支持插件页面桥接，或未从插件详情页入口打开；已安全降级为只读说明视图。', 'error', false);
+      setNotice('请从 AstrBot WebUI 插件页面入口打开此控制台。', 'error', false);
       bridgeUnavailable = true;
       setLoadingState(false);
       return;
@@ -1172,16 +1388,15 @@
       if (dom.refresh) dom.refresh.disabled = false;
       if (document.hidden) {
         setLoadingState(false);
-        setNotice('页面当前处于后台，切回前台后将自动读取快照。', '', false);
         schedulePoll();
       } else {
-        await refresh(true);
+        await refresh(true, false);
       }
     } catch (error) {
       if (disposed) return;
       const detail = window.E2BPanelBridge && error instanceof window.E2BPanelBridge.PanelClientError
         ? error.message
-        : '无法建立受信任的宿主桥接连接。请登录 WebUI 后从插件详情页重新打开。';
+        : '无法连接宿主桥接，请登录 WebUI 后重新打开。';
       setNotice(detail, 'error', false);
       bridgeUnavailable = true;
       setLoadingState(false);
@@ -1197,10 +1412,15 @@
     stopPolling();
     cancelRead();
     stopTicker();
+    hideToast();
     window.clearTimeout(searchTimer);
     searchTimer = null;
     window.clearTimeout(readyTimer);
     readyTimer = null;
+    if (resizeObserver && typeof resizeObserver.disconnect === 'function') {
+      resizeObserver.disconnect();
+      resizeObserver = null;
+    }
     if (typeof unsubscribeContext === 'function') {
       unsubscribeContext();
       unsubscribeContext = null;
@@ -1214,17 +1434,64 @@
     }
   }
 
-  if (dom.refresh) dom.refresh.addEventListener('click', () => { void refresh(true); });
-  if (dom.retry) dom.retry.addEventListener('click', () => { void refresh(true); });
-  if (dom.auto) dom.auto.addEventListener('change', schedulePoll);
-  if (dom.viewTableBtn) dom.viewTableBtn.addEventListener('click', () => setViewMode('table'));
-  if (dom.viewCardBtn) dom.viewCardBtn.addEventListener('click', () => setViewMode('cards'));
-  if (dom.themeToggle) {
-    dom.themeToggle.addEventListener('click', () => {
-      const current = document.documentElement ? document.documentElement.getAttribute('data-theme') : 'dark';
-      applyTheme(current === 'light' ? 'dark' : 'light');
+  /* 事件绑定 */
+  if (dom.refresh) dom.refresh.addEventListener('click', () => { void refresh(true, true); });
+  if (dom.retry) dom.retry.addEventListener('click', () => { void refresh(true, true); });
+  if (dom.auto) {
+    dom.auto.addEventListener('change', () => {
+      schedulePoll();
+      showToast(dom.auto.checked ? '已开启 10s 自动同步' : '已暂停自动同步');
     });
   }
+  if (dom.themeToggle) {
+    dom.themeToggle.addEventListener('click', () => {
+      const idx = THEME_MODES.indexOf(themeMode);
+      const next = THEME_MODES[(idx + 1) % THEME_MODES.length];
+      setThemeMode(next);
+    });
+  }
+  if (dom.viewTableBtn) dom.viewTableBtn.addEventListener('click', () => setViewMode('table'));
+  if (dom.viewCardBtn) dom.viewCardBtn.addEventListener('click', () => setViewMode('cards'));
+
+  if (dom.tabSessions) {
+    dom.tabSessions.addEventListener('click', () => switchTab('sessions'));
+    dom.tabSessions.addEventListener('keydown', (e) => {
+      if (e.key === 'ArrowRight' || e.key === 'End') { e.preventDefault(); switchTab('keys', true); }
+    });
+  }
+  if (dom.tabKeys) {
+    dom.tabKeys.addEventListener('click', () => switchTab('keys'));
+    dom.tabKeys.addEventListener('keydown', (e) => {
+      if (e.key === 'ArrowLeft' || e.key === 'Home') { e.preventDefault(); switchTab('sessions', true); }
+    });
+  }
+
+  if (dom.kpiRunningCard) {
+    dom.kpiRunningCard.addEventListener('click', () => {
+      switchTab('sessions');
+      setStatusFilter('running');
+    });
+  }
+  if (dom.kpiPausedCard) {
+    dom.kpiPausedCard.addEventListener('click', () => {
+      switchTab('sessions');
+      setStatusFilter('paused');
+    });
+  }
+  if (dom.kpiKeysCard) {
+    dom.kpiKeysCard.addEventListener('click', () => switchTab('keys'));
+  }
+
+  if (dom.statusPills) {
+    dom.statusPills.addEventListener('click', (event) => {
+      const target = event.target && typeof event.target.closest === 'function'
+        ? event.target.closest('.filter-pill') : null;
+      if (!target) return;
+      const filterVal = target.getAttribute('data-filter');
+      if (filterVal) setStatusFilter(filterVal);
+    });
+  }
+
   if (dom.search) {
     dom.search.addEventListener('input', () => {
       window.clearTimeout(searchTimer);
@@ -1240,15 +1507,19 @@
       }
     });
   }
-  if (dom.filter) dom.filter.addEventListener('change', () => { pageIndex = 0; renderSessions(); });
+  if (dom.filter) {
+    dom.filter.addEventListener('change', () => {
+      syncStatusPills(dom.filter.value);
+      pageIndex = 0;
+      renderSessions();
+    });
+  }
   if (dom.sort) dom.sort.addEventListener('change', () => { pageIndex = 0; renderSessions(); });
   if (dom.pageSize) dom.pageSize.addEventListener('change', () => { pageIndex = 0; renderSessions(); });
   if (dom.resetFilters) {
     dom.resetFilters.addEventListener('click', () => {
       if (dom.search) dom.search.value = '';
-      if (dom.filter) dom.filter.value = 'all';
-      pageIndex = 0;
-      renderSessions();
+      setStatusFilter('all');
     });
   }
   if (dom.previous) {
@@ -1294,6 +1565,17 @@
       if (!actionBusy) closeConfirmation();
     });
   }
+  if (dom.toastClose) {
+    dom.toastClose.addEventListener('click', hideToast);
+  }
+
+  if (typeof window.ResizeObserver === 'function' && dom.sessionsRegion) {
+    resizeObserver = new window.ResizeObserver((entries) => {
+      if (!entries || !entries[0] || !entries[0].contentRect) return;
+      syncCompactSwitcher(entries[0].contentRect.width);
+    });
+    resizeObserver.observe(dom.sessionsRegion);
+  }
 
   document.addEventListener('visibilitychange', () => {
     if (disposed) return;
@@ -1307,7 +1589,7 @@
     if (snapshot) startTicker();
     if (client && (!dom.auto || dom.auto.checked) && failures < FAILURE_LIMIT
         && !actionBusy && !(dom.dialog && dom.dialog.open)) {
-      void refresh(false);
+      void refresh(false, false);
     } else {
       schedulePoll();
     }

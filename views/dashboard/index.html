@@ -1,428 +1,395 @@
 <!doctype html>
-<html lang="zh-CN" data-theme="dark">
+<html lang="zh-CN" data-theme-mode="auto">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="dark light">
+  <meta name="color-scheme" content="light dark">
   <meta name="referrer" content="no-referrer">
+  <!-- 严格 CSP：宿主 plugin_page 通过同站路径 iframe（sandbox 阻断凭据）加载本页与 bridge-sdk.js；面板无任何外链资源，且宿主主题变量通过 CSSOM style.setProperty 注入，无需放开 http:/https: 或 unsafe-inline。 -->
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'none'; font-src 'none'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
-  <title>E2B 云沙箱可视化控制台</title>
+  <title>E2B 云沙箱控制台</title>
   <link rel="stylesheet" href="./panel.css">
   <script src="/api/plugin/page/bridge-sdk.js"></script>
   <script src="./bridge-client.js" defer></script>
   <script src="./panel.js" defer></script>
 </head>
 <body>
-  <a class="skip-link" href="#sessions-section">跳到云沙箱会话列表</a>
+  <a class="skip-link" href="#sessions-section">跳到实例列表</a>
 
-  <main class="console">
-    <!-- 顶部品牌与控制栏 -->
-    <header class="topbar fade-in fade-in--1">
-      <div class="brand-block">
-        <div class="brand-title-row">
-          <span class="brand-mark" aria-hidden="true">
-            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M12 2L3 7v10l9 5 9-5V7l-9-5z"/>
-              <path d="M3 7l9 5 9-5"/>
-              <path d="M12 22V12"/>
-              <circle cx="12" cy="12" r="2" fill="currentColor" stroke="none"/>
-            </svg>
-          </span>
-          <div class="brand-heading">
-            <div class="brand-name-line">
-              <h1>E2B 云端沙箱控制台</h1>
-              <span class="version-pill mono" id="plugin-version">v—</span>
-              <span class="scope-pill" id="scope-badge" title="当前群聊沙箱隔离模式">群聊共用模式</span>
-            </div>
-            <div class="brand-meta">
-              <span class="meta-item">
-                <span class="meta-label">实例已运行</span>
-                <span class="meta-value mono" id="plugin-uptime">—</span>
-              </span>
-              <span class="meta-sep" aria-hidden="true">·</span>
-              <span class="meta-item">
-                <span class="meta-label">快照时间</span>
-                <span class="meta-value mono" id="last-updated">—</span>
-              </span>
-            </div>
-          </div>
+  <main class="shell">
+    <!-- 顶部极简标题与控制栏 -->
+    <header class="page-header">
+      <div class="header-main">
+        <div class="title-row">
+          <h1>E2B 云沙箱</h1>
+          <span class="chip chip--primary mono" id="plugin-version">v—</span>
+          <span class="chip chip--neutral" id="scope-badge" title="群聊沙箱隔离模式">群聊共享</span>
+        </div>
+        <div class="header-meta">
+          <span>运行 <strong class="mono" id="plugin-uptime">—</strong></span>
+          <span class="meta-sep" aria-hidden="true">·</span>
+          <span>同步 <span class="mono" id="last-updated">—</span></span>
         </div>
       </div>
 
-      <div class="topbar-actions">
-        <span class="poll-pill" id="poll-pill">
-          <span class="poll-dot" aria-hidden="true"></span>
-          <span id="poll-state">等待宿主桥接</span>
-        </span>
-
-        <label class="switch" for="auto-refresh" title="每 10 秒自动同步一次本地追踪状态（不唤醒云沙箱）">
+      <div class="header-actions">
+        <label class="sync-pill" id="poll-pill" for="auto-refresh" title="每 10 秒同步本地追踪快照">
           <input id="auto-refresh" type="checkbox" checked>
-          <span class="switch-track" aria-hidden="true"><span class="switch-thumb"></span></span>
-          <span class="switch-label">10s 自动同步</span>
+          <span class="sync-dot" aria-hidden="true"></span>
+          <span id="poll-state">连接中</span>
         </label>
 
-        <button class="btn btn--icon" id="theme-toggle" type="button" aria-label="切换深浅色主题" title="切换深浅色主题">
-          <svg class="icon-sun" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <button class="btn btn--text" id="theme-toggle" type="button" aria-label="切换主题模式" title="切换主题：跟随宿主 / 浅色 / 深色">
+          <svg class="theme-icon theme-icon--auto" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="2" y="3" width="20" height="14" rx="2"/>
+            <path d="M8 21h8M12 17v4"/>
+          </svg>
+          <svg class="theme-icon theme-icon--light" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <circle cx="12" cy="12" r="4"/>
             <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/>
           </svg>
-          <svg class="icon-moon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <svg class="theme-icon theme-icon--dark" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
           </svg>
+          <span id="theme-label">跟随宿主</span>
         </button>
 
-        <button class="btn btn--primary" id="refresh-button" type="button" disabled>
+        <button class="btn btn--tonal" id="refresh-button" type="button" disabled>
           <svg class="refresh-icon" id="refresh-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <path d="M21 12a9 9 0 1 1-2.64-6.36"/>
             <path d="M21 3v6h-6"/>
           </svg>
-          <span id="refresh-label">刷新状态</span>
+          <span id="refresh-label">刷新</span>
         </button>
       </div>
     </header>
 
-    <!-- 状态通知横幅 -->
-    <div id="notice-bar" class="notice" role="status" aria-live="polite">
-      <div class="notice-main">
-        <span class="notice-dot" aria-hidden="true"></span>
-        <p id="notice" class="notice-text">正在连接 AstrBot WebUI。请从插件详情的页面入口打开，而非直接打开静态文件。</p>
+    <!-- 仅在异常或连接失败时展示的错误横幅 -->
+    <div id="notice-bar" class="alert-banner" role="alert" aria-live="polite" hidden>
+      <div class="alert-main">
+        <span class="alert-dot" aria-hidden="true"></span>
+        <p id="notice" class="alert-text">正在连接宿主…</p>
       </div>
-      <button id="retry-button" class="btn btn--ghost btn--sm" type="button" hidden>立即重试</button>
+      <button id="retry-button" class="btn btn--sm btn--text-danger" type="button" hidden>重试</button>
     </div>
 
     <noscript>
-      <p class="notice notice--error">此控制台需要启用 JavaScript；禁用脚本时不会读取快照或执行任何操作。</p>
+      <div class="alert-banner alert-banner--error">
+        <p class="alert-text">需要启用 JavaScript 才能使用此控制台。</p>
+      </div>
     </noscript>
 
-    <!-- 形象化生命周期流转全景条 -->
-    <section class="lifecycle-banner fade-in fade-in--2" aria-label="云沙箱省钱生命周期流转示意">
-      <div class="lifecycle-step">
-        <span class="lifecycle-icon lifecycle-icon--queue" aria-hidden="true">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
-            <circle cx="12" cy="12" r="9"/>
-            <path d="M12 7v5l3 2"/>
-          </svg>
-        </span>
-        <div class="lifecycle-copy">
-          <div class="lifecycle-title">1. 按需分配与排队 <span class="lifecycle-count mono" id="flow-queue-badge">0 排队</span></div>
-          <p class="lifecycle-desc">发消息跑代码时自动创建或唤醒，满额自动排队</p>
-        </div>
-      </div>
-
-      <span class="lifecycle-arrow" aria-hidden="true">→</span>
-
-      <div class="lifecycle-step">
-        <span class="lifecycle-icon lifecycle-icon--running" aria-hidden="true">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
-            <polygon points="5 3 19 12 5 21 5 3"/>
-          </svg>
-        </span>
-        <div class="lifecycle-copy">
-          <div class="lifecycle-title">2. 云端运行（按秒计费） <span class="lifecycle-count mono" id="flow-running-badge">0 运行</span></div>
-          <p class="lifecycle-desc" id="flow-idle-desc">跑完默认立即休眠；保持运行空闲超时也会自动休眠</p>
-        </div>
-      </div>
-
-      <span class="lifecycle-arrow" aria-hidden="true">→</span>
-
-      <div class="lifecycle-step">
-        <span class="lifecycle-icon lifecycle-icon--paused" aria-hidden="true">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
-            <rect x="6" y="4" width="4" height="16" rx="1"/>
-            <rect x="14" y="4" width="4" height="16" rx="1"/>
-          </svg>
-        </span>
-        <div class="lifecycle-copy">
-          <div class="lifecycle-title">3. 休眠暂停（免费保留） <span class="lifecycle-count mono" id="flow-paused-badge">0 休眠</span></div>
-          <p class="lifecycle-desc">暂停期间不扣费、不占并发槽位，变量与文件完整保留</p>
-        </div>
-      </div>
-
-      <span class="lifecycle-arrow" aria-hidden="true">→</span>
-
-      <div class="lifecycle-step">
-        <span class="lifecycle-icon lifecycle-icon--destroy" aria-hidden="true">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M3 6h18"/>
-            <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
-            <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
-          </svg>
-        </span>
-        <div class="lifecycle-copy">
-          <div class="lifecycle-title">4. 超期彻底回收</div>
-          <p class="lifecycle-desc" id="flow-retention-desc">休眠超过设定时长自动销毁释放，重要文件请及时发回</p>
-        </div>
-      </div>
-    </section>
-
-    <!-- 核心指标与可视化并发槽位矩阵 -->
-    <section class="kpi-strip fade-in fade-in--2" aria-label="沙箱核心状态指标">
-      <article class="kpi-card kpi-card--running">
-        <div class="kpi-head">
-          <span class="kpi-label"><i class="dot dot--running" aria-hidden="true"></i>运行中云机</span>
-          <span class="kpi-badge kpi-badge--running">计费中</span>
-        </div>
-        <strong class="kpi-value mono" id="count-running">—</strong>
-        <p class="kpi-sub" id="running-sub">正在执行或空闲待休眠</p>
-      </article>
-
-      <article class="kpi-card kpi-card--paused">
-        <div class="kpi-head">
-          <span class="kpi-label"><i class="dot dot--paused" aria-hidden="true"></i>已休眠沙箱</span>
-          <span class="kpi-badge kpi-badge--paused">零计费</span>
-        </div>
-        <strong class="kpi-value mono" id="count-paused">—</strong>
-        <p class="kpi-sub">保留内存变量与磁盘文件</p>
-      </article>
-
-      <article class="kpi-card">
-        <div class="kpi-head">
-          <span class="kpi-label"><i class="dot dot--unknown" aria-hidden="true"></i>启动 / 待确认</span>
-          <span class="kpi-badge">预留槽位</span>
-        </div>
-        <strong class="kpi-value mono" id="count-unknown">—</strong>
-        <p class="kpi-sub">创建重连中或待后台对账</p>
-      </article>
-
-      <article class="kpi-card">
-        <div class="kpi-head">
-          <span class="kpi-label"><i class="dot dot--neutral" aria-hidden="true"></i>排队等待中</span>
-          <span class="kpi-badge">FIFO 队列</span>
-        </div>
-        <strong class="kpi-value mono" id="capacity-waiting">—</strong>
-        <p class="kpi-sub">满额时等待空闲运行槽位</p>
-      </article>
-
-      <article class="kpi-card kpi-card--capacity">
-        <div class="kpi-head">
-          <span class="kpi-label">并发运行槽位矩阵（全局共享）</span>
-          <span class="kpi-percent mono" id="capacity-percent">—</span>
-        </div>
-        <div class="capacity-overview">
-          <div class="kpi-capacity-value">
-            <strong class="kpi-value mono" id="capacity-used">—</strong>
-            <span class="kpi-denom mono">/ <span id="capacity-limit">—</span> 台上限</span>
-          </div>
-          <p class="kpi-sub mono" id="capacity-brief">空闲槽位 — · 排队 —</p>
-        </div>
-        <div class="slot-matrix" id="slot-matrix" aria-hidden="true"></div>
-        <progress id="capacity-progress" class="capacity-bar" value="0" max="1" aria-label="已占用运行容量"></progress>
-      </article>
-    </section>
-
-    <!-- 主工作区：左侧会话管理台 + 右侧策略与 Key 池 -->
-    <div class="workspace fade-in fade-in--3">
-      <section class="panel sessions-panel" id="sessions-section" aria-labelledby="sessions-heading" tabindex="-1">
-        <div class="panel-header">
-          <div class="panel-title-group">
-            <h2 id="sessions-heading">云沙箱实例列表</h2>
-            <span class="chip mono" id="session-summary">共 — 条</span>
-            <span class="chip mono" id="count-total-chip">已追踪 <span id="count-total">—</span> 台</span>
-          </div>
-
-          <div class="view-switcher" role="group" aria-label="列表展示视图切换">
-            <button class="view-btn is-active" id="view-table-btn" type="button" aria-pressed="true" title="紧凑表格视图">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <rect x="3" y="4" width="18" height="16" rx="2"/>
-                <path d="M3 10h18M3 15h18"/>
-              </svg>
-              <span>表格</span>
-            </button>
-            <button class="view-btn" id="view-card-btn" type="button" aria-pressed="false" title="形象云机卡片视图">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <rect x="3" y="3" width="8" height="8" rx="1.5"/>
-                <rect x="13" y="3" width="8" height="8" rx="1.5"/>
-                <rect x="3" y="13" width="8" height="8" rx="1.5"/>
-                <rect x="13" y="13" width="8" height="8" rx="1.5"/>
-              </svg>
-              <span>卡片</span>
-            </button>
-          </div>
-        </div>
-
-        <div class="toolbar">
-          <label class="search-field" for="session-search">
-            <svg class="search-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <circle cx="11" cy="11" r="8"/>
-              <path d="M21 21l-4.35-4.35"/>
+    <!-- 4 张等宽核心状态概览卡 -->
+    <section class="overview-grid" aria-label="核心概览">
+      <button class="overview-card overview-card--interactive" id="kpi-running-card" type="button" title="筛选运行中的实例">
+        <div class="overview-head">
+          <span class="overview-icon overview-icon--running" aria-hidden="true">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polygon points="6 3 20 12 6 21 6 3"/>
             </svg>
-            <input id="session-search" type="search" placeholder="搜索群号、用户号、渠道名或沙箱 ID…" maxlength="240" autocomplete="off" aria-label="搜索会话标识或沙箱 ID">
-          </label>
+          </span>
+          <span class="chip chip--running">计费中</span>
+        </div>
+        <div class="overview-body">
+          <span class="overview-label">运行中</span>
+          <strong class="overview-value mono" id="count-running">—</strong>
+          <span class="overview-note" id="running-sub">占用运行槽位</span>
+        </div>
+      </button>
 
-          <div class="toolbar-selects">
-            <select id="status-filter" class="select" aria-label="按状态筛选">
-              <option value="all">全部状态</option>
-              <option value="running">运行中（计费）</option>
-              <option value="paused">已休眠（免费）</option>
-              <option value="starting">唤醒 / 创建中</option>
-              <option value="unknown">状态待确认</option>
-              <option value="busy">任务执行中</option>
-            </select>
+      <button class="overview-card overview-card--interactive" id="kpi-paused-card" type="button" title="筛选已休眠的实例">
+        <div class="overview-head">
+          <span class="overview-icon overview-icon--paused" aria-hidden="true">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="6" y="4" width="4" height="16" rx="1"/>
+              <rect x="14" y="4" width="4" height="16" rx="1"/>
+            </svg>
+          </span>
+          <span class="chip chip--paused">零计费</span>
+        </div>
+        <div class="overview-body">
+          <span class="overview-label">已休眠</span>
+          <strong class="overview-value mono" id="count-paused">—</strong>
+          <span class="overview-note" id="paused-sub">保留状态</span>
+        </div>
+      </button>
 
-            <select id="session-sort" class="select" aria-label="排序方式">
-              <option value="last_active_desc">最近活动（新→旧）</option>
-              <option value="last_active_asc">最近活动（旧→新）</option>
-              <option value="created_at_desc">创建时间（新→旧）</option>
-              <option value="created_at_asc">创建时间（旧→新）</option>
-            </select>
+      <article class="overview-card">
+        <div class="overview-head">
+          <span class="overview-icon overview-icon--primary" aria-hidden="true">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="2" y="3" width="20" height="7" rx="2"/>
+              <rect x="2" y="14" width="20" height="7" rx="2"/>
+              <line x1="6" y1="6.5" x2="6.01" y2="6.5"/>
+              <line x1="6" y1="17.5" x2="6.01" y2="17.5"/>
+            </svg>
+          </span>
+          <span class="overview-percent mono" id="capacity-percent">—</span>
+        </div>
+        <div class="overview-body">
+          <span class="overview-label">运行槽位</span>
+          <div class="overview-ratio">
+            <strong class="overview-value mono" id="capacity-used">—</strong>
+            <span class="overview-denom mono">/ <span id="capacity-limit">—</span></span>
+          </div>
+          <div class="slot-matrix" id="slot-matrix" aria-hidden="true"></div>
+          <progress id="capacity-progress" class="sr-only" value="0" max="1" aria-label="运行槽位占用"></progress>
+          <span class="overview-note mono" id="capacity-brief">空闲 — · 排队 <span id="capacity-waiting">—</span></span>
+        </div>
+      </article>
 
-            <select id="page-size" class="select" aria-label="每页条数">
-              <option value="10">10 台/页</option>
-              <option value="20" selected>20 台/页</option>
-              <option value="50">50 台/页</option>
-            </select>
+      <button class="overview-card overview-card--interactive" id="kpi-keys-card" type="button" title="查看 API Key 轮询池与配额">
+        <div class="overview-head">
+          <span class="overview-icon overview-icon--primary" aria-hidden="true">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="7.5" cy="15.5" r="4.5"/>
+              <path d="M10.7 12.3L21 2"/>
+              <path d="M17 6l3 3"/>
+            </svg>
+          </span>
+          <span class="chip chip--neutral" id="kpi-keys-status">—</span>
+        </div>
+        <div class="overview-body">
+          <span class="overview-label">API Key 池</span>
+          <div class="overview-ratio">
+            <strong class="overview-value mono" id="kpi-keys-available">—</strong>
+            <span class="overview-denom mono">/ <span id="kpi-keys-total">—</span></span>
+          </div>
+          <span class="overview-note">查看轮询与配额 →</span>
+        </div>
+      </button>
+    </section>
+
+    <!-- 官方 DataPage 风格分段导航栏 -->
+    <div class="workspace-bar">
+      <div class="tabs-scroll">
+        <div class="tabs-list" role="tablist" aria-label="控制台视图">
+          <button class="tab-btn" id="tab-sessions" type="button" role="tab" aria-selected="true" tabindex="0">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect x="2" y="3" width="20" height="14" rx="2"/>
+              <path d="M8 21h8M12 17v4"/>
+            </svg>
+            <span>云沙箱实例</span>
+            <span class="tab-count mono" id="count-total">—</span>
+          </button>
+
+          <button class="tab-btn" id="tab-keys" type="button" role="tab" aria-selected="false" tabindex="-1">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+            </svg>
+            <span>Key 池与配额</span>
+            <span class="tab-alert-dot" id="tab-keys-dot" hidden aria-hidden="true"></span>
+          </button>
+        </div>
+      </div>
+
+      <div class="view-switcher" id="view-switch-wrap" role="group" aria-label="展示视图">
+        <button class="view-btn is-active" id="view-table-btn" type="button" aria-pressed="true" title="表格视图">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="3" y="4" width="18" height="16" rx="2"/>
+            <path d="M3 10h18M3 15h18"/>
+          </svg>
+          <span>表格</span>
+        </button>
+        <button class="view-btn" id="view-card-btn" type="button" aria-pressed="false" title="卡片视图">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="3" y="3" width="8" height="8" rx="1.5"/>
+            <rect x="13" y="3" width="8" height="8" rx="1.5"/>
+            <rect x="3" y="13" width="8" height="8" rx="1.5"/>
+            <rect x="13" y="13" width="8" height="8" rx="1.5"/>
+          </svg>
+          <span>卡片</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- Tab 1：云沙箱实例（全宽） -->
+    <div id="tabpanel-sessions" role="tabpanel" aria-labelledby="tab-sessions">
+      <section class="surface-card sessions-card" id="sessions-section" aria-label="云沙箱实例列表" tabindex="-1">
+        <div class="card-toolbar">
+          <div class="toolbar-top">
+            <label class="search-field" for="session-search">
+              <svg class="search-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <circle cx="11" cy="11" r="8"/>
+                <path d="M21 21l-4.35-4.35"/>
+              </svg>
+              <input id="session-search" type="search" placeholder="搜索群号、用户、渠道、Key 或沙箱 ID…" maxlength="240" autocomplete="off" aria-label="搜索云沙箱实例">
+            </label>
+
+            <div class="toolbar-selects">
+              <select id="status-filter" class="sr-only" aria-label="按状态筛选">
+                <option value="all">全部</option>
+                <option value="running">运行中</option>
+                <option value="paused">已休眠</option>
+                <option value="starting">唤醒中</option>
+                <option value="unknown">待确认</option>
+                <option value="pending">启动 / 待确认</option>
+                <option value="busy">执行中</option>
+              </select>
+
+              <select id="session-sort" class="select" aria-label="排序方式">
+                <option value="last_active_desc">最近活跃</option>
+                <option value="last_active_asc">最早活跃</option>
+                <option value="created_at_desc">最新创建</option>
+                <option value="created_at_asc">最早创建</option>
+              </select>
+
+              <select id="page-size" class="select" aria-label="每页数量">
+                <option value="10">10 / 页</option>
+                <option value="20" selected>20 / 页</option>
+                <option value="50">50 / 页</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="filter-pills" id="status-pills" role="group" aria-label="快捷状态筛选">
+            <button class="filter-pill is-active" type="button" data-filter="all" aria-pressed="true">全部 <span class="mono" id="pill-count-all">0</span></button>
+            <button class="filter-pill" type="button" data-filter="running" aria-pressed="false">运行中 <span class="mono" id="pill-count-running">0</span></button>
+            <button class="filter-pill" type="button" data-filter="paused" aria-pressed="false">已休眠 <span class="mono" id="pill-count-paused">0</span></button>
+            <button class="filter-pill" type="button" data-filter="pending" aria-pressed="false">启动 / 待确认 <span class="mono" id="count-unknown">0</span></button>
+            <button class="filter-pill" type="button" data-filter="busy" aria-pressed="false">执行中 <span class="mono" id="pill-count-busy">0</span></button>
           </div>
         </div>
 
         <div id="sessions-region" class="sessions-region" data-view="table" aria-busy="true">
-          <div class="table-wrap" id="table-wrap" tabindex="0" role="region" aria-labelledby="sessions-heading">
+          <div class="table-wrap" id="table-wrap" tabindex="0" role="region" aria-label="云沙箱实例表">
             <table class="session-table">
               <thead>
                 <tr>
-                  <th scope="col" class="col-identity">对话来源 / 云沙箱实例</th>
-                  <th scope="col" class="col-status">运行状态</th>
-                  <th scope="col" class="col-key">绑定账号 / 模板</th>
-                  <th scope="col" class="col-time">活跃度与保留寿命</th>
-                  <th scope="col" class="col-files" title="传入沙箱的附件数与执行产出的缓存文件数">文件往来</th>
-                  <th scope="col" class="col-actions">实例管控</th>
+                  <th scope="col" class="col-identity">来源 / 沙箱 ID</th>
+                  <th scope="col" class="col-status">状态</th>
+                  <th scope="col" class="col-key">Key / 环境</th>
+                  <th scope="col" class="col-time">活跃与寿命</th>
+                  <th scope="col" class="col-files">文件</th>
+                  <th scope="col" class="col-actions">操作</th>
                 </tr>
               </thead>
               <tbody id="session-list"></tbody>
             </table>
           </div>
 
-          <div id="session-empty" class="empty-state">
-            <div class="empty-graphic" aria-hidden="true">
-              <svg width="48" height="48" viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-                <rect x="8" y="10" width="32" height="28" rx="5"/>
-                <path d="M8 18h32"/>
-                <circle cx="14" cy="14" r="1.3" fill="currentColor" stroke="none"/>
-                <circle cx="19" cy="14" r="1.3" fill="currentColor" stroke="none"/>
-                <path d="M17 25l4 3.5-4 3.5"/>
-                <path d="M24 32h7"/>
+          <div id="session-empty" class="empty-state" hidden>
+            <span class="empty-icon" aria-hidden="true">
+              <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="2" y="3" width="20" height="14" rx="2"/>
+                <path d="M8 21h8M12 17v4"/>
               </svg>
-            </div>
-            <h3 id="empty-title">还没有活跃或休眠的云沙箱</h3>
-            <p id="empty-desc">当用户在聊天里让机器人计算数据、处理 Excel 或画图时，分配的云电脑会实时出现在这里。</p>
-            <button id="reset-filters" class="btn btn--ghost btn--sm" type="button" hidden>清空筛选条件</button>
+            </span>
+            <p class="empty-title" id="empty-title">暂无云沙箱实例</p>
+            <button id="reset-filters" class="btn btn--sm btn--tonal" type="button" hidden>重置筛选</button>
           </div>
         </div>
 
-        <nav class="pagination" aria-label="会话列表分页">
-          <span class="page-summary mono" id="page-summary">—</span>
+        <nav class="pagination" aria-label="分页">
+          <span class="page-summary mono" id="session-summary">共 — 台</span>
           <div class="page-controls">
-            <button class="btn btn--ghost btn--sm" id="previous-page" type="button" disabled>上一页</button>
+            <span class="page-range mono" id="page-summary"></span>
+            <button class="btn btn--sm btn--text" id="previous-page" type="button" disabled>上一页</button>
             <span class="page-label mono" id="page-label">1 / 1</span>
-            <button class="btn btn--ghost btn--sm" id="next-page" type="button" disabled>下一页</button>
+            <button class="btn btn--sm btn--text" id="next-page" type="button" disabled>下一页</button>
           </div>
         </nav>
       </section>
+    </div>
 
-      <!-- 右侧边栏：API Key 池与分组策略 -->
-      <aside class="sidebar" aria-label="API Key 轮询池与配额规则">
-        <section class="panel" aria-labelledby="keys-heading">
-          <div class="panel-header">
-            <div class="panel-title-group">
-              <h2 id="keys-heading">API Key 轮询池</h2>
-            </div>
-            <span class="chip mono" id="key-count">—</span>
+    <!-- Tab 2：API Key 池与运行配额 -->
+    <div id="tabpanel-keys" role="tabpanel" aria-labelledby="tab-keys" hidden>
+      <div class="split-grid">
+        <section class="surface-card panel-padded" aria-labelledby="keys-heading">
+          <div class="section-head">
+            <h2 id="keys-heading">API Key 轮询池</h2>
+            <span class="chip chip--primary mono" id="key-count">—</span>
           </div>
           <div id="key-list" class="key-list">
-            <p class="muted small">等待读取本地快照…</p>
+            <p class="muted small">加载中…</p>
           </div>
-          <p class="panel-footnote">提示：支持在配置中填写 <code class="inline-code">e2b_xxx # 主力号</code> 为每把 Key 添加易读备注。新沙箱按序轮询；已有沙箱始终绑定原创建账户。</p>
         </section>
 
-        <section class="panel" aria-labelledby="capacity-heading">
-          <div class="panel-header">
-            <h2 id="capacity-heading">运行规则与配额</h2>
-            <span id="capacity-pending" class="badge badge--paused" hidden>调度上限待同步</span>
+        <section class="surface-card panel-padded" aria-labelledby="capacity-heading">
+          <div class="section-head">
+            <h2 id="capacity-heading">运行配额</h2>
+            <span id="capacity-pending" class="chip chip--paused" hidden>上限待同步</span>
           </div>
 
           <div class="policy-groups">
             <div class="policy-group">
-              <h3 class="policy-group-title">并发与排队调度</h3>
+              <h3 class="policy-title">并发与排队</h3>
               <dl class="policy-list">
                 <div class="policy-row"><dt>同时运行上限</dt><dd class="mono" id="capacity-limit-detail">—</dd></div>
-                <div class="policy-row"><dt>当前占用槽位</dt><dd class="mono" id="capacity-occupied-detail">—</dd></div>
-                <div class="policy-row"><dt>剩余可用名额</dt><dd class="mono" id="capacity-free">—</dd></div>
+                <div class="policy-row"><dt>当前占用</dt><dd class="mono" id="capacity-occupied-detail">—</dd></div>
+                <div class="policy-row"><dt>剩余可用</dt><dd class="mono" id="capacity-free">—</dd></div>
                 <div class="policy-row"><dt>当前排队 / 队列容量</dt><dd class="mono" id="capacity-queue">—</dd></div>
                 <div class="policy-row"><dt>排队最长等待</dt><dd class="mono" id="capacity-timeout">—</dd></div>
               </dl>
             </div>
 
             <div class="policy-group">
-              <h3 class="policy-group-title">自动休眠与到期回收</h3>
+              <h3 class="policy-title">休眠与回收</h3>
               <dl class="policy-list">
-                <div class="policy-row"><dt>空闲自动暂停</dt><dd class="mono" id="policy-idle-pause">—</dd></div>
+                <div class="policy-row"><dt>空闲自动休眠</dt><dd class="mono" id="policy-idle-pause">—</dd></div>
                 <div class="policy-row"><dt>休眠最长保留</dt><dd class="mono" id="policy-paused-retention">—</dd></div>
               </dl>
             </div>
 
             <div class="policy-group">
-              <h3 class="policy-group-title">文件传输体积边界</h3>
+              <h3 class="policy-title">文件上限</h3>
               <dl class="policy-list">
-                <div class="policy-row"><dt>单个上传附件上限</dt><dd class="mono" id="policy-upload-limit">—</dd></div>
-                <div class="policy-row"><dt>单个回传产物上限</dt><dd class="mono" id="policy-return-limit">—</dd></div>
+                <div class="policy-row"><dt>单附件上传</dt><dd class="mono" id="policy-upload-limit">—</dd></div>
+                <div class="policy-row"><dt>单产物回传</dt><dd class="mono" id="policy-return-limit">—</dd></div>
               </dl>
             </div>
           </div>
         </section>
-      </aside>
+      </div>
     </div>
-
-    <footer class="footer">
-      <div class="footer-item">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-          <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
-        </svg>
-        <span>零干扰只读快照：打开或刷新本页面不会连接或唤醒任何云端沙箱，绝不产生额外计费。</span>
-      </div>
-      <div class="footer-item">
-        <span>安全护栏：密钥全链路脱敏 · 乐观版本校验 · 暂停与销毁强制二次确认</span>
-      </div>
-    </footer>
   </main>
 
-  <!-- 原生模态确认对话框（不加冗余 role/aria-modal，由原生 showModal 提供无障碍焦点隔离） -->
-  <dialog id="confirm-dialog" aria-labelledby="confirm-title" aria-describedby="confirm-description">
+  <!-- 原生模态确认对话框（不加冗余 role/aria-modal；AstrBot 28px 大圆角与胶囊操作按钮） -->
+  <dialog id="confirm-dialog" closedby="closerequest" aria-labelledby="confirm-title" aria-describedby="confirm-description">
     <div class="dialog-body">
       <div class="dialog-header">
-        <span class="dialog-eyebrow" id="confirm-eyebrow">管理操作二次确认</span>
-        <h2 id="confirm-title">确认操作</h2>
+        <h1 id="confirm-title">确认操作</h1>
       </div>
       <p id="confirm-description" class="dialog-desc"></p>
 
       <dl class="dialog-target">
-        <div><dt>对话来源</dt><dd id="confirm-session"></dd></div>
-        <div><dt>目标云沙箱 ID</dt><dd class="mono" id="confirm-sandbox"></dd></div>
-        <div><dt>绑定 API Key</dt><dd id="confirm-key"></dd></div>
+        <div><dt>来源</dt><dd id="confirm-session"></dd></div>
+        <div><dt>沙箱 ID</dt><dd class="mono" id="confirm-sandbox"></dd></div>
+        <div><dt>绑定 Key</dt><dd id="confirm-key"></dd></div>
       </dl>
 
       <label class="dialog-check" id="pause-ack-label" for="pause-ack">
         <input id="pause-ack" type="checkbox">
-        <span>我确认暂停此云沙箱（立即释放并发槽位并停止计费，保留沙箱内变量与文件）。</span>
+        <span>确认休眠此云沙箱（停止计费并释放槽位）</span>
       </label>
 
-      <div class="dialog-field-wrap" id="kill-input-label" hidden>
+      <div class="dialog-field" id="kill-input-label" hidden>
         <div class="dialog-field-head">
-          <label for="kill-id">请输入上方完整沙箱 ID 以确认永久销毁</label>
-          <button class="btn-link" id="fill-kill-id" type="button" title="自动填入上方目标沙箱 ID 以便核对">填入目标 ID</button>
+          <label for="kill-id">输入沙箱 ID 确认销毁</label>
+          <button class="btn-inline" id="fill-kill-id" type="button">填入 ID</button>
         </div>
-        <input id="kill-id" type="text" autocomplete="off" spellcheck="false" maxlength="256" placeholder="输入或核对目标沙箱 ID">
-        <span class="kill-match-hint mono" id="kill-match-hint">等待输入核对…</span>
+        <input id="kill-id" type="text" autocomplete="off" spellcheck="false" maxlength="256" placeholder="完整沙箱 ID">
+        <span class="kill-match-hint mono" id="kill-match-hint"></span>
       </div>
 
       <p id="action-feedback" class="dialog-feedback" role="status" aria-live="polite"></p>
 
       <div class="dialog-actions">
-        <button id="cancel-action" class="btn btn--ghost" type="button">取消 (Esc)</button>
-        <button id="confirm-action" class="btn btn--primary" type="button" disabled>确认操作</button>
+        <button id="cancel-action" class="btn btn--text btn--pill" type="button">取消</button>
+        <button id="confirm-action" class="btn btn--flat btn--pill" type="button" disabled>确认</button>
       </div>
     </div>
   </dialog>
 
-  <!-- 纯内联无外部引用 SVG 图标模板库（供脚本安全克隆，完全符合严格 CSP） -->
+  <!-- AstrBot v-snackbar 风格轻提示区域 -->
+  <div class="toast-region" role="region" aria-label="操作提示">
+    <div id="toast" class="toast" hidden>
+      <span id="toast-text" role="status" aria-live="polite"></span>
+      <button id="toast-close" class="toast-close" type="button" aria-label="关闭提示">×</button>
+    </div>
+  </div>
+
+  <!-- 纯内联 SVG 图标模板（零外链） -->
   <template id="tpl-icon-group">
     <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
       <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>
@@ -437,14 +404,14 @@
       <circle cx="12" cy="7" r="4"/>
     </svg>
   </template>
-  <template id="tpl-icon-vm">
+  <template id="tpl-icon-copy">
     <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-      <rect x="2" y="3" width="20" height="14" rx="2"/>
-      <path d="M8 21h8M12 17v4"/>
+      <rect x="9" y="9" width="13" height="13" rx="2"/>
+      <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
     </svg>
   </template>
   <template id="tpl-icon-key">
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
       <circle cx="7.5" cy="15.5" r="4.5"/>
       <path d="M10.7 12.3L21 2"/>
       <path d="M17 6l3 3"/>
