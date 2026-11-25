@@ -844,7 +844,7 @@ vm.runInNewContext(code, {
         self.assertIn("panel DOM assertions passed", result.stdout)
 
     @unittest.skipUnless(shutil.which("node"), "Node unavailable; bridge error mapping check skipped")
-    def test_bridge_maps_exact_public_errors_and_propagates_session(self):
+    def test_bridge_maps_exact_public_errors_and_ignores_host_session(self):
         script = r"""
 const fs = require('node:fs');
 const vm = require('node:vm');
@@ -866,11 +866,11 @@ const emit = (data) => {
 };
 (async () => {
   const client = fake.E2BPanelBridge.createClient(fake, 50);
-  // 模拟宿主下发带 session 的 context，后续请求应自动透传 session
+  // 宿主 plugin_page 协议不使用 session；即使收到带 session 的非 response 消息也不得缓存或伪造透传
   emit({channel: 'astrbot-plugin-page', kind: 'context', session: 'sess-xyz', context: {}});
 
   const stale = client.act({action: 'pause'});
-  assert.equal(posted[0].value.session, 'sess-xyz');
+  assert.equal('session' in posted[0].value, false);
   emit({
     channel: 'astrbot-plugin-page', kind: 'response', requestId: posted[0].value.requestId,
     ok: false, error: '该会话的沙箱或版本已变化，请刷新后重新确认。',
@@ -910,6 +910,139 @@ const emit = (data) => {
                                 capture_output=True, text=True, timeout=15)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("bridge public error allowlist assertions passed", result.stdout)
+
+    def test_dashboard_strict_csp_and_no_inline_scripts(self):
+        from html.parser import HTMLParser
+
+        class SecurityHTMLParser(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.csp_values = []
+                self.scripts = []
+                self._in_script = False
+                self._script_attrs = {}
+                self._script_chunks = []
+
+            def handle_starttag(self, tag, attrs):
+                attr_map = {k.lower(): (v or "") for k, v in attrs}
+                if tag.lower() == "meta" and attr_map.get("http-equiv", "").lower() == "content-security-policy":
+                    self.csp_values.append(attr_map.get("content", ""))
+                elif tag.lower() == "script":
+                    self._in_script = True
+                    self._script_attrs = attr_map
+                    self._script_chunks = []
+
+            def handle_data(self, data):
+                if self._in_script:
+                    self._script_chunks.append(data)
+
+            def handle_endtag(self, tag):
+                if tag.lower() == "script" and self._in_script:
+                    self.scripts.append((self._script_attrs, "".join(self._script_chunks)))
+                    self._in_script = False
+
+        html = (DASHBOARD / "index.html").read_text(encoding="utf-8")
+        parser = SecurityHTMLParser()
+        parser.feed(html)
+        parser.close()
+
+        self.assertEqual(len(parser.csp_values), 1)
+        csp = parser.csp_values[0]
+        csp_lower = csp.lower()
+        self.assertNotIn("http:", csp_lower)
+        self.assertNotIn("https:", csp_lower)
+        self.assertNotIn("unsafe-inline", csp_lower)
+        self.assertIn("script-src 'self'", csp)
+        self.assertIn("style-src 'self'", csp)
+        self.assertIn("connect-src 'none'", csp)
+
+        directives = {}
+        for part in csp.split(";"):
+            part = part.strip()
+            if not part:
+                continue
+            tokens = part.split()
+            directives[tokens[0].lower()] = tokens[1:]
+        self.assertEqual(directives.get("script-src"), ["'self'"])
+        self.assertEqual(directives.get("style-src"), ["'self'"])
+        self.assertEqual(directives.get("connect-src"), ["'none'"])
+
+        self.assertGreaterEqual(len(parser.scripts), 3)
+        for attrs, body in parser.scripts:
+            self.assertTrue(attrs.get("src", "").strip(), "inline <script> without src is forbidden")
+            self.assertEqual(body.strip(), "", "script element with src must not contain inline code")
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable; bridge session regression check skipped")
+    def test_bridge_correlates_by_request_id_across_varying_host_sessions(self):
+        script = r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+const assert = require('node:assert/strict');
+const {randomUUID} = require('node:crypto');
+const listeners = new Set();
+const posted = [];
+const parent = {postMessage: (value, origin) => posted.push({value, origin})};
+const fake = {
+  crypto: {randomUUID}, URL,
+  location: {href: 'https://webui.example/api/plugin/view/assets/tok/p/dashboard/index.html'},
+  parent, setTimeout, clearTimeout,
+  addEventListener: (name, listener) => { if (name === 'message') listeners.add(listener); },
+  removeEventListener: (name, listener) => { listeners.delete(listener); },
+};
+vm.runInNewContext(fs.readFileSync(process.argv[1], 'utf8'), {window: fake});
+const emit = (data, origin = 'https://webui.example', source = parent) => {
+  for (const listener of [...listeners]) listener({data, origin, source});
+};
+(async () => {
+  const client = fake.E2BPanelBridge.createClient(fake, 100);
+
+  // 场景1：顺序请求，模拟宿主先后下发不同 session ('abc' -> 'def')，均应按 requestId 正常关联且不抛异常
+  const firstReq = client.getSnapshot();
+  assert.equal('session' in posted[0].value, false);
+  emit({
+    channel: 'astrbot-plugin-page', kind: 'response', requestId: posted[0].value.requestId,
+    session: 'abc', ok: true, data: {status: 'ok', data: {tag: 'first'}},
+  });
+  assert.deepEqual(await firstReq, {tag: 'first'});
+  assert.equal(client.pendingCount(), 0);
+
+  const secondReq = client.act({action: 'pause', expected_version: 'v1'});
+  assert.equal('session' in posted[1].value, false);
+  emit({
+    channel: 'astrbot-plugin-page', kind: 'response', requestId: posted[1].value.requestId,
+    session: 'def', ok: true, data: {status: 'ok', data: {tag: 'second'}},
+  });
+  assert.deepEqual(await secondReq, {tag: 'second'});
+  assert.equal(client.pendingCount(), 0);
+
+  // 场景2：并发交错请求，先回 session:'def' 后回 session:'abc'，各自按 requestId 精确匹配对应 pending
+  const reqA = client.getSnapshot();
+  const reqB = client.act({action: 'kill', expected_version: 'v2'});
+  assert.equal(client.pendingCount(), 2);
+  emit({
+    channel: 'astrbot-plugin-page', kind: 'response', requestId: posted[3].value.requestId,
+    session: 'def', ok: true, data: {status: 'ok', data: {which: 'B'}},
+  });
+  emit({
+    channel: 'astrbot-plugin-page', kind: 'response', requestId: posted[2].value.requestId,
+    session: 'abc', ok: true, data: {status: 'ok', data: {which: 'A'}},
+  });
+  assert.deepEqual(await reqB, {which: 'B'});
+  assert.deepEqual(await reqA, {which: 'A'});
+  assert.equal(client.pendingCount(), 0);
+
+  // 认证边界与白名单 endpoint 不降级
+  await assert.rejects(client.act({action: 'pause'}), {code: 'timeout'});
+  client.destroy();
+  console.log('bridge varying-session correlation assertions passed');
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+"""
+        node = shutil.which("node")
+        assert node is not None
+        result = subprocess.run([node, "-e", script, str(DASHBOARD / "bridge-client.js")],
+                                capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("bridge varying-session correlation assertions passed", result.stdout)
 
     @unittest.skipUnless(shutil.which("node"), "Node unavailable; redesign regression check skipped")
     def test_panel_tri_state_theme_tabs_cooldown_peak_and_file_counts(self):

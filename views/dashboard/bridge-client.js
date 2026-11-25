@@ -121,18 +121,16 @@
     const pending = new Map();
     const instance = makeInstanceId(windowObject.crypto);
     const safeTimeoutMs = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 30000;
-    let bridgeSession = '';
     let sequence = 0;
     let destroyed = false;
 
+    // 本插件仅以 target=plugin_page 嵌入 AstrBot PluginViewFrame；该宿主协议不发送也不校验 session
+    // （仅 chat_message 卡片使用 session），故不维护可变 bridgeSession 状态并忽略消息中的 session 字段。
+    // 请求关联完全依赖本客户端生成的 requestId 与严格 parent source/origin 校验，认证边界与白名单 endpoint 不降级。
     const onMessage = (event) => {
       if (event.source !== windowObject.parent || event.origin !== expectedParentOrigin) return;
       const message = event.data;
-      if (!message || typeof message !== 'object' || message.channel !== CHANNEL) return;
-      if (typeof message.session === 'string' && message.session && !bridgeSession) {
-        bridgeSession = message.session;
-      }
-      if (message.kind !== 'response') return;
+      if (!message || typeof message !== 'object' || message.channel !== CHANNEL || message.kind !== 'response') return;
       const entry = pending.get(message.requestId);
       if (!entry) return;
       if (message.ok !== true) {
@@ -181,7 +179,6 @@
           finish(new PanelClientError('timeout', '宿主桥接响应超时；操作可能仍在执行，请刷新检查。'));
         }, safeTimeoutMs);
         const payload = {channel: CHANNEL, kind: 'request', requestId, action, endpoint};
-        if (bridgeSession) payload.session = bridgeSession;
         if (action === 'api:post') payload.body = body;
         else payload.params = {};
         try {
