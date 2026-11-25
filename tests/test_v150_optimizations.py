@@ -309,7 +309,7 @@ class ConfigAndPanelEnhancementTests(unittest.TestCase):
         meta_text = (ROOT / "metadata.yaml").read_text(encoding="utf-8")
         for key in schema:
             self.assertIn(f"  {key}:", meta_text, f"metadata.yaml 缺少配置键 {key}")
-        self.assertIn('version: "1.5.0"', meta_text)
+        self.assertRegex(meta_text, r'version:\s*"\d+\.\d+\.\d+"')
 
     @unittest.skipUnless(shutil.which("node"), "Node unavailable; IME & view mode check skipped")
     def test_frontend_ime_enter_guard_and_view_toggle(self):

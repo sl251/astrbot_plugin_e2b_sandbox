@@ -1,7 +1,7 @@
 # AstrBot E2B 云沙箱插件 (`astrbot_plugin_e2b_sandbox`)
 
 ![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20Docker-blue)
-![Version](https://img.shields.io/badge/Version-1.5.0-blueviolet)
+![Version](https://img.shields.io/badge/Version-1.6.0-blueviolet)
 ![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.9.2-orange)
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
 ![License](https://img.shields.io/badge/License-AGPL--3.0-green)
@@ -208,9 +208,10 @@ E2B 按沙箱**实际运行时间每秒计费**，暂停、销毁或超时后立
 
 ## 🚀 最近更新
 
+- **v1.6.0**：控制台安全边界加固（合并 PR #18）——CSP 收紧为同源脚本与样式，禁止任意外部脚本与内联执行；明确桥接客户端与宿主 `plugin_page` 协议边界，移除无效 session 状态，保留来源校验、请求关联与错误脱敏；新增 CSP 与桥接回归测试。UI、主题与交互不变。
 - **v1.5.0**：全新升级 WebUI 可视化控制台（生命周期流转条、槽位矩阵、渠道可读解析、保留寿命条、表格/卡片双视图与 Key 备注别名）；新增宿主机 SSRF 与敏感路径防护；修复 QQ/微信分条发送文档被清空、子目录产物漏检与多图截断；引入预装库毫秒级缓存、按需绘图引导与多 Key 独立并发创建锁，并支持 `group_member` 群成员独立沙箱模式。
 
-完整历史变更记录（v1.0.0 – v1.5.0）请查看 [CHANGELOG.md](CHANGELOG.md)。
+完整历史变更记录（v1.0.0 – v1.6.0）请查看 [CHANGELOG.md](CHANGELOG.md)。
 
 ---
 

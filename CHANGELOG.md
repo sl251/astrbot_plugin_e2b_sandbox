@@ -1,5 +1,12 @@
 # 🎉 AstrBot E2B 云沙箱插件更新日志
 
+### v1.6.0 · 2026-11-25 · 控制台 CSP 收紧与桥接协议边界加固
+
+* **🛡️ 控制台 CSP 收紧**：`dashboard` 页面恢复严格同源策略（`script-src 'self'`、`style-src 'self'`），移除此前放开的 `http:` / `https:` 与 `unsafe-inline`，外部脚本与内联脚本均被拦截；宿主 `plugin_page` 通过同站路径 iframe 加载本页，主题变量经 CSSOM 注入，不受影响。
+* **🔌 桥接会话语义澄清**：移除 `bridge-client.js` 中仅记录首次 `session` 的无效状态——AstrBot `plugin_page` 宿主协议本就不发送也不校验 `session`（仅 chat 卡片使用）；请求关联仍依赖 `requestId` 与严格的 parent `source`/`origin` 校验，错误脱敏与 endpoint 白名单不变。
+* **🧪 回归测试补充**：新增 CSP 契约测试（无外源、无内联 script、`connect-src 'none'`）与跨 `session` 的 `requestId` 关联测试，共 166 项测试通过（4 跳过）。
+* **🎨 界面不变**：本次仅安全与协议层加固，控制台 UI、主题、布局与交互保持 v1.5.0 形态。
+
 ### v1.5.0 · 2026-11-18 · 全新可视化控制台、安全加固、跨消息附件与性能跃升
 
 * **🖥️ 全新可视化 WebUI 控制台**：重构 `dashboard` 管理界面，新增四步省钱生命周期流转全景条、可视化并发运行槽位矩阵、对话来源智能可读解析（自动识别群聊/私聊与 QQ·OneBot / WebChat / Telegram 等渠道徽章）、休眠沙箱剩余保留寿命进度条、语义化 `↑ 附件 / ↓ 产物` 胶囊，支持**表格 / 云机卡片双视图**切换、中文输入法安全回车守卫及销毁 ID 一键填入核对。

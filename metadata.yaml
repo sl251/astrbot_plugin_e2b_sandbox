@@ -1,6 +1,6 @@
 name: astrbot_plugin_e2b_sandbox
 author: sl251
-version: "1.5.0"
+version: "1.6.0"
 astrbot_version: ">=4.9.2"
 description: "E2B 云沙箱 Python 执行、会话持久化、多 API Key 并行轮询、可视化管理台与安全防护"
 repo: "https://github.com/sl251/astrbot_plugin_e2b_sandbox"
